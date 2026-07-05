@@ -96,6 +96,25 @@ async def retrieve_episodes(
         except NotImplementedError:
             pass
 
+    # ArcadeDB stores a native datetime write as a zone-less ChronoLocalDateTime
+    # but decodes an incoming native datetime parameter as a zone-aware
+    # OffsetDateTime -- comparing them directly raises a ClassCastException at
+    # the engine level (confirmed: reproducible whenever a range index on the
+    # property was created before any data existed, which is exactly what
+    # build_indices_and_constraints() always does). Wrapping both sides in
+    # datetime(...) sidesteps it; scoped to ARCADEDB only so the other
+    # providers' generated Cypher is untouched.
+    valid_at_where = (
+        'WHERE datetime(e.valid_at) <= datetime($reference_time)'
+        if driver.provider == GraphProvider.ARCADEDB
+        else 'WHERE e.valid_at <= $reference_time'
+    )
+    valid_at_order = (
+        'ORDER BY datetime(e.valid_at) DESC'
+        if driver.provider == GraphProvider.ARCADEDB
+        else 'ORDER BY e.valid_at DESC'
+    )
+
     # If saga is provided, retrieve episodes from that saga only
     if saga is not None:
         group_id = group_ids[0] if group_ids else None
@@ -104,7 +123,7 @@ async def retrieve_episodes(
         records, _, _ = await driver.execute_query(
             f"""
             MATCH (s:Saga {{name: $saga_name, group_id: $group_id}})-[:HAS_EPISODE]->(e:Episodic)
-            WHERE e.valid_at <= $reference_time
+            {valid_at_where}
             {source_filter}
             RETURN
             """
@@ -113,8 +132,8 @@ async def retrieve_episodes(
                 if driver.provider == GraphProvider.NEPTUNE
                 else EPISODIC_NODE_RETURN
             )
-            + """
-            ORDER BY e.valid_at DESC
+            + f"""
+            {valid_at_order}
             LIMIT $num_episodes
             """,
             saga_name=saga,
@@ -138,9 +157,9 @@ async def retrieve_episodes(
         query_params['source'] = source.name
 
     query: LiteralString = (
-        """
+        f"""
                                     MATCH (e:Episodic)
-                                    WHERE e.valid_at <= $reference_time
+                                    {valid_at_where}
                                     """
         + query_filter
         + """
@@ -151,8 +170,8 @@ async def retrieve_episodes(
             if driver.provider == GraphProvider.NEPTUNE
             else EPISODIC_NODE_RETURN
         )
-        + """
-        ORDER BY e.valid_at DESC
+        + f"""
+        {valid_at_order}
         LIMIT $num_episodes
         """
     )

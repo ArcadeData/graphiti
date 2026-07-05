@@ -26,7 +26,7 @@ from typing_extensions import LiteralString
 from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.decorators import handle_multiple_group_ids
-from graphiti_core.driver.driver import GraphDriver
+from graphiti_core.driver.driver import GraphDriver, GraphProvider
 from graphiti_core.driver.neo4j_driver import Neo4jDriver
 from graphiti_core.edges import (
     CommunityEdge,
@@ -403,12 +403,21 @@ class Graphiti:
             except NotImplementedError:
                 pass
 
+        # ArcadeDB-only: wrap valid_at/created_at in datetime(...) to avoid a
+        # ClassCastException comparing native-datetime representations once a
+        # range index exists on the property (same class of bug fixed in
+        # graph_data_operations.py::retrieve_episodes()).
+        order_by = (
+            'ORDER BY datetime(e.valid_at) DESC, datetime(e.created_at) DESC'
+            if self.driver.provider == GraphProvider.ARCADEDB
+            else 'ORDER BY e.valid_at DESC, e.created_at DESC'
+        )
         records, _, _ = await self.driver.execute_query(
-            """
-            MATCH (s:Saga {uuid: $saga_uuid})-[:HAS_EPISODE]->(e:Episodic)
+            f"""
+            MATCH (s:Saga {{uuid: $saga_uuid}})-[:HAS_EPISODE]->(e:Episodic)
             WHERE e.uuid <> $current_episode_uuid
             RETURN e.uuid AS uuid
-            ORDER BY e.valid_at DESC, e.created_at DESC
+            {order_by}
             LIMIT 1
             """,
             saga_uuid=saga_uuid,
@@ -485,13 +494,25 @@ class Graphiti:
             saga_id, since=since, limit=max_episodes
         )
         if episodes_data is None:
+            # ArcadeDB-only: see the note in _saga_get_previous_episode_uuid.
+            is_arcadedb = self.driver.provider == GraphProvider.ARCADEDB
             if since is not None:
+                created_at_where = (
+                    'WHERE datetime(e.created_at) > datetime($since)'
+                    if is_arcadedb
+                    else 'WHERE e.created_at > $since'
+                )
+                order_by = (
+                    'ORDER BY datetime(e.valid_at) ASC, datetime(e.created_at) ASC'
+                    if is_arcadedb
+                    else 'ORDER BY e.valid_at ASC, e.created_at ASC'
+                )
                 records, _, _ = await self.driver.execute_query(
-                    """
-                    MATCH (s:Saga {uuid: $saga_uuid})-[:HAS_EPISODE]->(e:Episodic)
-                    WHERE e.created_at > $since
+                    f"""
+                    MATCH (s:Saga {{uuid: $saga_uuid}})-[:HAS_EPISODE]->(e:Episodic)
+                    {created_at_where}
                     RETURN e.content AS content, e.valid_at AS valid_at
-                    ORDER BY e.valid_at ASC, e.created_at ASC
+                    {order_by}
                     LIMIT $limit
                     """,
                     saga_uuid=saga_id,
@@ -500,11 +521,16 @@ class Graphiti:
                     routing_='r',
                 )
             else:
+                order_by = (
+                    'ORDER BY datetime(e.valid_at) DESC, datetime(e.created_at) DESC'
+                    if is_arcadedb
+                    else 'ORDER BY e.valid_at DESC, e.created_at DESC'
+                )
                 records, _, _ = await self.driver.execute_query(
-                    """
-                    MATCH (s:Saga {uuid: $saga_uuid})-[:HAS_EPISODE]->(e:Episodic)
+                    f"""
+                    MATCH (s:Saga {{uuid: $saga_uuid}})-[:HAS_EPISODE]->(e:Episodic)
                     RETURN e.content AS content, e.valid_at AS valid_at
-                    ORDER BY e.valid_at DESC, e.created_at DESC
+                    {order_by}
                     LIMIT $limit
                     """,
                     saga_uuid=saga_id,

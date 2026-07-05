@@ -105,8 +105,25 @@ def node_search_filter_query_constructor(
 
 
 def date_filter_query_constructor(
-    value_name: str, param_name: str, operator: ComparisonOperator
+    value_name: str,
+    param_name: str,
+    operator: ComparisonOperator,
+    provider: GraphProvider | None = None,
 ) -> str:
+    # ArcadeDB stores a native datetime write as a zone-less ChronoLocalDateTime
+    # but decodes an incoming native datetime parameter as a zone-aware
+    # OffsetDateTime -- comparing them directly can raise a ClassCastException
+    # at the engine level once a range index exists on the property (same class
+    # of bug as retrieve_episodes(), see graph_data_operations.py). Wrapping
+    # both sides in datetime(...) sidesteps it; scoped to ARCADEDB only, and
+    # skipped for IS NULL/IS NOT NULL since there's no value to wrap there.
+    if provider == GraphProvider.ARCADEDB and operator not in (
+        ComparisonOperator.is_null,
+        ComparisonOperator.is_not_null,
+    ):
+        value_name = f'datetime({value_name})'
+        param_name = f'datetime({param_name})'
+
     query = '(' + value_name + ' '
 
     if operator == ComparisonOperator.is_null or operator == ComparisonOperator.is_not_null:
@@ -158,7 +175,7 @@ def edge_search_filter_query_constructor(
 
             and_filters = [
                 date_filter_query_constructor(
-                    'e.valid_at', f'$valid_at_{j}', date_filter.comparison_operator
+                    'e.valid_at', f'$valid_at_{j}', date_filter.comparison_operator, provider
                 )
                 for j, date_filter in enumerate(or_list)
             ]
@@ -189,7 +206,7 @@ def edge_search_filter_query_constructor(
 
             and_filters = [
                 date_filter_query_constructor(
-                    'e.invalid_at', f'$invalid_at_{j}', date_filter.comparison_operator
+                    'e.invalid_at', f'$invalid_at_{j}', date_filter.comparison_operator, provider
                 )
                 for j, date_filter in enumerate(or_list)
             ]
@@ -220,7 +237,7 @@ def edge_search_filter_query_constructor(
 
             and_filters = [
                 date_filter_query_constructor(
-                    'e.created_at', f'$created_at_{j}', date_filter.comparison_operator
+                    'e.created_at', f'$created_at_{j}', date_filter.comparison_operator, provider
                 )
                 for j, date_filter in enumerate(or_list)
             ]
@@ -251,7 +268,7 @@ def edge_search_filter_query_constructor(
 
             and_filters = [
                 date_filter_query_constructor(
-                    'e.expired_at', f'$expired_at_{j}', date_filter.comparison_operator
+                    'e.expired_at', f'$expired_at_{j}', date_filter.comparison_operator, provider
                 )
                 for j, date_filter in enumerate(or_list)
             ]
