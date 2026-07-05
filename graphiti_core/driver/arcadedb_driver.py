@@ -43,6 +43,7 @@ from graphiti_core.driver.arcadedb.operations.next_episode_edge_ops import (
 )
 from graphiti_core.driver.arcadedb.operations.saga_node_ops import ArcadeDBSagaNodeOperations
 from graphiti_core.driver.arcadedb.operations.search_ops import ArcadeDBSearchOperations
+from graphiti_core.driver.arcadedb.search_interface import ArcadeDBSearchInterface
 from graphiti_core.driver.driver import GraphDriver, GraphDriverSession, GraphProvider
 from graphiti_core.driver.operations.community_edge_ops import CommunityEdgeOperations
 from graphiti_core.driver.operations.community_node_ops import CommunityNodeOperations
@@ -57,6 +58,7 @@ from graphiti_core.driver.operations.saga_node_ops import SagaNodeOperations
 from graphiti_core.driver.operations.search_ops import SearchOperations
 from graphiti_core.driver.query_executor import Transaction
 from graphiti_core.graph_queries import get_fulltext_indices, get_range_indices
+from graphiti_core.utils.datetime_utils import convert_datetimes_to_strings
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +101,7 @@ class ArcadeDBDriver(GraphDriver):
         self._next_episode_edge_ops = ArcadeDBNextEpisodeEdgeOperations()
         self._search_ops = ArcadeDBSearchOperations()
         self._graph_ops = ArcadeDBGraphMaintenanceOperations()
+        self.search_interface = ArcadeDBSearchInterface()
 
         self.aoss_client = None
 
@@ -164,10 +167,26 @@ class ArcadeDBDriver(GraphDriver):
         params = kwargs.pop('params', None)
         if params is None:
             params = {}
-        kwargs.setdefault('database_', self._database)
+        database_ = kwargs.pop('database_', self._database)
+
+        # ArcadeDB's Bolt plugin stores a native datetime write as a
+        # zone-less ChronoLocalDateTime, but an incoming native datetime
+        # query parameter is decoded as a zone-aware OffsetDateTime -- the
+        # two are not directly comparable, and Cypher's implicit WHERE/ORDER
+        # BY coercion between them raises a ClassCastException at the engine
+        # level (confirmed against a real instance: reproducible whenever a
+        # range index on the property was created before any data existed,
+        # which is exactly what build_indices_and_constraints() always does).
+        # Serializing to an ISO string here, combined with the ARCADEDB-only
+        # datetime(...) wrap in retrieve_episodes(), sidesteps it.
+        params = convert_datetimes_to_strings(params)
+        query_params = convert_datetimes_to_strings(kwargs)
+        query_params['database_'] = database_
 
         try:
-            result = await self.client.execute_query(cypher_query_, parameters_=params, **kwargs)
+            result = await self.client.execute_query(
+                cypher_query_, parameters_=params, **query_params
+            )
         except Exception as e:
             logger.error(f'Error executing ArcadeDB query: {e}\n{cypher_query_}\n{params}')
             raise

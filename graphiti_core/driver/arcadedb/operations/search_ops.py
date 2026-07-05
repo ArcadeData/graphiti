@@ -116,8 +116,16 @@ class ArcadeDBSearchOperations(SearchOperations):
         if filter_queries:
             filter_query = ' AND ' + (' AND '.join(filter_queries))
 
-        # Use toLower/CONTAINS for fulltext search (compatible with ArcadeDB Cypher)
-        search_terms = lucene_sanitize(query).split()
+        # Use toLower/CONTAINS for fulltext search (compatible with ArcadeDB Cypher).
+        # NOTE: use the raw query terms here, NOT lucene_sanitize(query) -- that
+        # escapes special/reserved characters with a literal backslash (e.g.
+        # 'Alice' -> '\Alice'), which is correct for building a real Lucene
+        # query string but breaks a literal CONTAINS substring match against
+        # unescaped stored text (verified: 'Alice' never matches
+        # toLower(n.name) CONTAINS '\alice'). lucene_sanitize is still used
+        # above via _build_arcadedb_fulltext_query purely as an empty/oversized
+        # query gate, not for the actual match text.
+        search_terms = query.split()
         if not search_terms:
             return []
 
@@ -171,16 +179,14 @@ class ArcadeDBSearchOperations(SearchOperations):
             filter_queries.append('n.group_id IN $group_ids')
             filter_params['group_ids'] = group_ids
 
-        filter_query = ''
-        if filter_queries:
-            filter_query = ' WHERE ' + (' AND '.join(filter_queries))
+        filter_queries.append('n.name_embedding IS NOT NULL')
+        filter_query = ' WHERE ' + (' AND '.join(filter_queries))
 
         # Fetch candidate nodes with embeddings
         cypher = (
             'MATCH (n:Entity)'
             + filter_query
             + """
-            WHERE n.name_embedding IS NOT NULL
             RETURN
             """
             + get_entity_node_return_query(GraphProvider.ARCADEDB)
@@ -286,8 +292,11 @@ class ArcadeDBSearchOperations(SearchOperations):
         if filter_queries:
             filter_query = ' AND ' + (' AND '.join(filter_queries))
 
-        # Use CONTAINS for fulltext search
-        search_terms = lucene_sanitize(query).split()
+        # Use CONTAINS for fulltext search. NOTE: raw query terms, NOT
+        # lucene_sanitize(query) -- see node_fulltext_search for why (it
+        # Lucene-escapes with a literal backslash, which never matches
+        # unescaped stored text via CONTAINS).
+        search_terms = query.split()
         if not search_terms:
             return []
 
@@ -342,24 +351,22 @@ class ArcadeDBSearchOperations(SearchOperations):
             filter_queries.append('e.group_id IN $group_ids')
             filter_params['group_ids'] = group_ids
 
-            if source_node_uuid is not None:
-                filter_params['source_uuid'] = source_node_uuid
-                filter_queries.append('n.uuid = $source_uuid')
+        if source_node_uuid is not None:
+            filter_params['source_uuid'] = source_node_uuid
+            filter_queries.append('n.uuid = $source_uuid')
 
-            if target_node_uuid is not None:
-                filter_params['target_uuid'] = target_node_uuid
-                filter_queries.append('m.uuid = $target_uuid')
+        if target_node_uuid is not None:
+            filter_params['target_uuid'] = target_node_uuid
+            filter_queries.append('m.uuid = $target_uuid')
 
-        filter_query = ''
-        if filter_queries:
-            filter_query = ' WHERE ' + (' AND '.join(filter_queries))
+        filter_queries.append('e.fact_embedding IS NOT NULL')
+        filter_query = ' WHERE ' + (' AND '.join(filter_queries))
 
         # Fetch candidate edges with embeddings
         cypher = (
             'MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)'
             + filter_query
             + """
-            WHERE e.fact_embedding IS NOT NULL
             RETURN DISTINCT
             """
             + get_entity_edge_return_query(GraphProvider.ARCADEDB)
@@ -460,8 +467,9 @@ class ArcadeDBSearchOperations(SearchOperations):
             group_filter_query += '\nAND e.group_id IN $group_ids'
             filter_params['group_ids'] = group_ids
 
-        # Use CONTAINS for fulltext search
-        search_terms = lucene_sanitize(query).split()
+        # Use CONTAINS for fulltext search. NOTE: raw query terms, NOT
+        # lucene_sanitize(query) -- see node_fulltext_search for why.
+        search_terms = query.split()
         if not search_terms:
             return []
 
@@ -511,8 +519,9 @@ class ArcadeDBSearchOperations(SearchOperations):
             group_filter_query = 'AND c.group_id IN $group_ids'
             filter_params['group_ids'] = group_ids
 
-        # Use CONTAINS for fulltext search
-        search_terms = lucene_sanitize(query).split()
+        # Use CONTAINS for fulltext search. NOTE: raw query terms, NOT
+        # lucene_sanitize(query) -- see node_fulltext_search for why.
+        search_terms = query.split()
         if not search_terms:
             return []
 
@@ -553,17 +562,17 @@ class ArcadeDBSearchOperations(SearchOperations):
     ) -> list[CommunityNode]:
         query_params: dict[str, Any] = {}
 
-        group_filter_query = ''
+        filter_queries = ['c.name_embedding IS NOT NULL']
         if group_ids is not None:
-            group_filter_query += ' WHERE c.group_id IN $group_ids'
+            filter_queries.append('c.group_id IN $group_ids')
             query_params['group_ids'] = group_ids
 
         # Fetch candidate communities with embeddings
         cypher = (
             'MATCH (c:Community)'
-            + group_filter_query
+            + ' WHERE '
+            + (' AND '.join(filter_queries))
             + """
-            WHERE c.name_embedding IS NOT NULL
             RETURN
             """
             + COMMUNITY_NODE_RETURN
