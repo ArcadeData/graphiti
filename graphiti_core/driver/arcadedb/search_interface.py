@@ -16,6 +16,8 @@ limitations under the License.
 
 from typing import Any
 
+from pydantic import PrivateAttr
+
 from graphiti_core.driver.arcadedb.operations.search_ops import ArcadeDBSearchOperations
 from graphiti_core.driver.search_interface.search_interface import SearchInterface
 
@@ -53,8 +55,7 @@ class ArcadeDBSearchInterface(SearchInterface):
     already-working path.
     """
 
-    def __init__(self):
-        self._ops = ArcadeDBSearchOperations()
+    _ops: ArcadeDBSearchOperations = PrivateAttr(default_factory=ArcadeDBSearchOperations)
 
     async def edge_fulltext_search(
         self,
