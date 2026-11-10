@@ -514,6 +514,40 @@ async def test_graphiti_group_id_provisions_a_missing_tenant_database(driver):
             _admin(f'drop database {tenant}')
 
 
+async def test_reading_an_unknown_group_id_returns_nothing_and_creates_no_database(driver):
+    """A search with a mistyped group_id used to create (and index) a database just to find
+    nothing in it. Only a write creates a tenant database."""
+    tenant = f'typo_{uuid4().hex[:8]}'
+    scoped = driver.clone(tenant)
+
+    def exists() -> bool:
+        response = httpx.get(f'{ARCADEDB_HTTP_URI}/api/v1/exists/{tenant}', auth=AUTH)
+        return response.json()['result']
+
+    try:
+        assert not exists()
+        assert await node_fulltext_search(scoped, 'zebra', SearchFilters(), [tenant], limit=5) == []
+        near = await node_similarity_search(
+            scoped, _axis(0), SearchFilters(), [tenant], limit=5, min_score=0.0
+        )
+        assert near == []
+        records, _, _ = await scoped.execute_query('MATCH (n) RETURN n', routing_='r')
+        assert records == []
+        assert not exists()
+
+        with pytest.raises(ValueError, match='Invalid ArcadeDB database name'):
+            await driver.clone('not a valid name!').execute_query('RETURN 1', routing_='r')
+
+        node = _entity('Zebra', tenant, _axis(0))
+        await node.save(scoped)  # the first write creates it, with its indexes
+        assert exists()
+        found = await node_fulltext_search(scoped, 'zebra', SearchFilters(), [tenant], limit=5)
+        assert [n.uuid for n in found] == [node.uuid]
+    finally:
+        if exists():
+            _admin(f'drop database {tenant}')
+
+
 async def test_fulltext_with_several_group_ids_returns_every_listed_tenant(driver):
     """The group clause is `group_id:"A" OR group_id:"B" AND (q)`; tenant scoping must not
     depend on Lucene's operator precedence."""

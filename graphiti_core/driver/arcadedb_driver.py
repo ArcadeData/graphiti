@@ -149,6 +149,7 @@ class ArcadeDBDriver(GraphDriver):
         self._auto_provision = False
         self._default_database = database
         self._provisioned: set[str] = {database}
+        self._existing: set[str] = set()
         self._provision_lock = asyncio.Lock()
 
         # Instantiate ArcadeDB operations
@@ -230,7 +231,11 @@ class ArcadeDBDriver(GraphDriver):
         if params is None:
             params = {}
         kwargs.setdefault('database_', self._database)
-        await self._ensure_database(kwargs['database_'])
+        if kwargs.get('routing_') == 'r':
+            if not await self._readable(kwargs['database_']):
+                return EagerResult(records=[], summary=None, keys=[])  # type: ignore[arg-type]
+        else:
+            await self._ensure_database(kwargs['database_'])
 
         try:
             result = await self.client.execute_query(cypher_query_, parameters_=params, **kwargs)
@@ -294,6 +299,23 @@ class ArcadeDBDriver(GraphDriver):
             scoped._auto_provision = False
             await scoped.build_indices_and_constraints()
             self._provisioned.add(database)
+
+    async def _readable(self, database: str) -> bool:
+        """Whether a read may go to ``database``; a missing one is an empty tenant, not an error.
+
+        A search with a mistyped ``group_id`` used to create (and index) a database just to
+        find nothing in it. Reads of a missing database now come back empty and leave
+        creation to the first write. Existence is cached once seen, so only the first read
+        of a tenant pays the probe.
+        """
+        if not self._auto_provision or database in self._provisioned or database in self._existing:
+            return True
+        if not _DATABASE_NAME.fullmatch(database):
+            raise ValueError(f'Invalid ArcadeDB database name: {database!r}')
+        if await self._database_exists(database):
+            self._existing.add(database)
+            return True
+        return False
 
     async def _database_exists(self, database: str) -> bool:
         try:
