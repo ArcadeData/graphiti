@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Live tests against an ArcadeDB server (26.10.1+) with the Bolt plugin enabled.
+Live tests against an ArcadeDB server (26.11.1+) with the Bolt plugin enabled.
 Each test gets its own throwaway database, created and dropped over the HTTP API at
 ARCADEDB_HTTP_URI (see tests/helpers_test.py).
 """

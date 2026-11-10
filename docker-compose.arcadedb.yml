@@ -1,8 +1,8 @@
 services:
   arcadedb:
-    image: arcadedata/arcadedb:26.12.1-SNAPSHOT
-    # The snapshot tag is mutable: always pull so the newest build is used.
-    pull_policy: always
+    image: arcadedata/arcadedb:26.11.1
+    # The oldest release the driver supports (26.10.x lacks Cypher fulltext/vector index DDL).
+    # A release tag is immutable, so CI and local runs see the same server.
     container_name: arcadedb-graphiti
     ports:
       - "2481:2480" # HTTP / Studio

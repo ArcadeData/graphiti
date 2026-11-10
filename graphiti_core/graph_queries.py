@@ -26,7 +26,7 @@ INDEX_TO_LABEL_KUZU_MAPPING = {
     'edge_name_and_fact': 'RelatesToNode_',
 }
 
-# ArcadeDB's fulltext and vector indexes are created with Cypher DDL (26.10.1+) and
+# ArcadeDB's fulltext and vector indexes are created with Cypher DDL (26.11.1+) and
 # addressed by the name given in that DDL, so ArcadeDB reuses the logical fulltext index
 # names the other providers use (node_name_and_summary, ...).
 

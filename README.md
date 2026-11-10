@@ -156,7 +156,7 @@ particularly suitable for applications requiring real-time interaction and preci
 Requirements:
 
 - Python 3.10 or higher
-- Neo4j 5.26 / FalkorDB 1.1.2 / Kuzu 0.11.2 / ArcadeDB 26.9.1 / Amazon Neptune Database Cluster or Neptune Analytics Graph + Amazon
+- Neo4j 5.26 / FalkorDB 1.1.2 / Kuzu 0.11.2 / ArcadeDB 26.11.1+ / Amazon Neptune Database Cluster or Neptune Analytics Graph + Amazon
   OpenSearch Serverless collection (serves as the full text search backend)
 - OpenAI API key (Graphiti defaults to OpenAI for LLM inference and embedding)
 
@@ -438,6 +438,9 @@ graphiti = Graphiti(graph_driver=driver)
 ```
 
 #### ArcadeDB
+
+ArcadeDB 26.11.1 or newer is required: it is the first release with the Cypher `CREATE FULLTEXT INDEX` /
+`CREATE VECTOR INDEX` DDL (26.10.x rejects it) and the 3-argument `db.index.fulltext.query*` procedures.
 
 ```python
 from graphiti_core import Graphiti

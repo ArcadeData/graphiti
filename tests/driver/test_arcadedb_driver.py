@@ -373,7 +373,7 @@ class TestArcadeDBDriver:
 
     @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
     def test_fulltext_query_passes_limit_option(self):
-        """The 3-argument form (ArcadeDB 26.10.1+) lets the engine stop at `limit`."""
+        """The 3-argument form (ArcadeDB 26.11.1+) lets the engine stop at `limit`."""
         from graphiti_core.graph_queries import get_nodes_query, get_relationships_query
 
         assert '{limit: $limit}' in get_nodes_query(

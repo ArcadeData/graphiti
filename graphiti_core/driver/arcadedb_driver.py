@@ -91,9 +91,10 @@ class ArcadeDBDriver(GraphDriver):
     Python async driver for transport while adapting queries for ArcadeDB's
     OpenCypher and SQL dialect.
 
-    Requires ArcadeDB 26.10.1 or newer (Cypher ``CREATE FULLTEXT INDEX`` /
-    ``CREATE VECTOR INDEX``, the 3-argument ``db.index.fulltext.query*`` procedures and
-    the filtered ``db.index.vector.queryNodes``); developed against 26.12.1. The Bolt
+    Requires ArcadeDB 26.11.1 or newer (Cypher ``CREATE FULLTEXT INDEX`` /
+    ``CREATE VECTOR INDEX``, which 26.10.x rejects, the 3-argument ``db.index.fulltext.query*``
+    procedures and the filtered ``db.index.vector.queryNodes``). The live test suites pass on
+    the released 26.11.1; developed against 26.12.1. The Bolt
     plugin must be enlisted at server startup and listens on port 7687 by default::
 
         -Darcadedb.server.plugins=Bolt:com.arcadedb.bolt.BoltProtocolPlugin
