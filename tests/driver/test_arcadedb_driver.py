@@ -502,10 +502,33 @@ class TestArcadeDBDriver:
         )  # fmt: skip
 
         executor = MagicMock()
-        executor.execute_query = AsyncMock(
-            side_effect=Exception("Index with name 'Entity[name_embedding]' was not found")
-        )
-        assert await ann_search(executor, **kwargs) is None
+        # what ArcadeDB 26.11.1 actually answers with no index (type present) and with no type
+        for message in (
+            "{message: No vector index found on property 'name_embedding' for type 'Entity'}",
+            "{message: Error executing procedure: Type with name 'Entity' was not found}",
+            "Index with name 'Entity[name_embedding]' was not found",
+        ):
+            executor.execute_query = AsyncMock(side_effect=Exception(message))
+            assert await ann_search(executor, **kwargs) is None, message
+
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def test_unknown_vector_quantization_is_rejected(self):
+        with (
+            patch('graphiti_core.driver.arcadedb_driver.AsyncGraphDatabase'),
+            pytest.raises(ValueError, match='vector_quantization'),
+        ):
+            ArcadeDBDriver(uri='bolt://x:7687', user='u', password='p', vector_quantization='x')  # type: ignore[arg-type]
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_ann_search_unrelated_errors_still_raise(self):
+        from graphiti_core.driver.arcadedb.search_queries import ann_search
+
+        kwargs = dict(
+            label='Entity', alias='n', return_query='n.uuid AS uuid', search_vector=[1.0],
+            filter_queries=[], filter_params={}, group_ids=None, limit=10, min_score=0.6,
+        )  # fmt: skip
+        executor = MagicMock()
 
         executor.execute_query = AsyncMock(side_effect=Exception('connection reset'))
         with pytest.raises(Exception, match='connection reset'):

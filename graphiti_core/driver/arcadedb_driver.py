@@ -173,6 +173,11 @@ class ArcadeDBDriver(GraphDriver):
         self._password = password or ''
         self._http_uri = http_uri or self._default_http_uri(uri)
         self.embedding_dim = embedding_dim
+        if vector_quantization not in ('none', 'scalar', 'binary'):
+            raise ValueError(
+                f"vector_quantization must be 'none', 'scalar' or 'binary', not "
+                f'{vector_quantization!r}'
+            )
         self.vector_quantization: ArcadeDBVectorQuantization = vector_quantization
         self.use_vector_index = use_vector_index
         self._buckets = buckets
@@ -309,7 +314,10 @@ class ArcadeDBDriver(GraphDriver):
                     cypher_query_, parameters_=params, **kwargs
                 )
         except Exception as e:
-            logger.error(f'Error executing ArcadeDB query: {e}\n{cypher_query_}\n{params}')
+            # Parameter values can carry episode content, so only their names are logged.
+            logger.error(
+                f'Error executing ArcadeDB query: {e}\n{cypher_query_}\nparams: {sorted(params)}'
+            )
             raise
 
         return result

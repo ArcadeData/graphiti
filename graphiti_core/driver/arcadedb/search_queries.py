@@ -68,9 +68,27 @@ def ann_query(
     return cast(LiteralString, query), k
 
 
+def _vector_index_unavailable(error: Exception, label: str) -> bool:
+    """Whether ``error`` says the vector index (or its type) does not exist yet.
+
+    ArcadeDB 26.11.1 words it "No vector index found on property 'name_embedding' for type
+    'Entity'" when the type exists and "Type with name 'Entity' was not found" when it does
+    not, as happens when ``build_indices_and_constraints()`` has not run.
+    """
+    message = str(error)
+    return (
+        vector_index_name(label) in message
+        or 'No vector index found' in message
+        or f"Type with name '{label}' was not found" in message
+    )
+
+
 def _ann_call(label: str, by_group: bool) -> str:
     options = ", {where: 'group_id IN :group_ids'}" if by_group else ''
-    return f"CALL db.index.vector.queryNodes('{vector_index_name(label)}', $k, $search_vector{options})"
+    return (
+        f"CALL db.index.vector.queryNodes('{vector_index_name(label)}', $k, "
+        f'$search_vector{options})'
+    )
 
 
 def ann_window_query(*, label: str, by_group: bool) -> LiteralString:
@@ -78,7 +96,10 @@ def ann_window_query(*, label: str, by_group: bool) -> LiteralString:
 
     Params: ``search_vector``, ``k`` and ``group_ids`` when ``by_group``.
     """
-    query = f'{_ann_call(label, by_group)} YIELD score RETURN count(score) AS candidates, min(score) AS lowest'
+    query = (
+        f'{_ann_call(label, by_group)} YIELD score '
+        'RETURN count(score) AS candidates, min(score) AS lowest'
+    )
     return cast(LiteralString, query)
 
 
@@ -125,7 +146,7 @@ async def ann_search(
             **params,
         )
     except Exception as e:
-        if vector_index_name(label) in str(e):
+        if _vector_index_unavailable(e, label):
             logger.warning(
                 f'ArcadeDB vector index {vector_index_name(label)} unavailable, falling back '
                 f'to exact similarity search: {e}'
