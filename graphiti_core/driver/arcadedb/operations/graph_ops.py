@@ -63,8 +63,8 @@ class ArcadeDBGraphMaintenanceOperations(GraphMaintenanceOperations):
         fulltext_indices = get_fulltext_indices(GraphProvider.ARCADEDB)
         index_queries = range_indices + fulltext_indices
 
-        # Execute index creation queries sequentially since ArcadeDB SQL DDL
-        # may not handle concurrent index creation on the same type
+        # Execute index creation queries sequentially so concurrent DDL on one type
+        # cannot race.
         for q in index_queries:
             try:
                 await executor.execute_query(q)

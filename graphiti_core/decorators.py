@@ -28,13 +28,13 @@ F = TypeVar('F', bound=Callable[..., Awaitable[Any]])
 
 def handle_multiple_group_ids(func: F) -> F:
     """
-    Decorator for FalkorDB methods that need to handle multiple group_ids.
+    Decorator for FalkorDB / ArcadeDB methods that need to handle multiple group_ids.
     Runs the function for each group_id separately and merges results.
 
-    Also routes a *single* group_id to the matching FalkorDB graph via a
-    call-scoped driver clone. Without this, add_episode re-binds the shared
-    driver for writes while search/retrieve with one group_id query the
-    driver's default database and silently return empty results (#1659).
+    Also routes a *single* group_id to the matching FalkorDB graph / ArcadeDB
+    database via a call-scoped driver clone. Without this, add_episode re-binds
+    the shared driver for writes while search/retrieve with one group_id query
+    the driver's default database and silently return empty results (#1659).
     """
 
     @functools.wraps(func)
@@ -49,15 +49,17 @@ def handle_multiple_group_ids(func: F) -> F:
         if group_ids is None and group_ids_pos is not None and len(args) > group_ids_pos:
             group_ids = args[group_ids_pos]
 
-        is_falkor = (
+        # FalkorDB graphs and ArcadeDB databases are named after the group_id
+        # (Graphiti._resolve_request_scope clones the driver per group_id for writes).
+        is_database_per_group = (
             hasattr(self, 'clients')
             and hasattr(self.clients, 'driver')
-            and self.clients.driver.provider == GraphProvider.FALKORDB
+            and self.clients.driver.provider in (GraphProvider.FALKORDB, GraphProvider.ARCADEDB)
         )
 
-        # FalkorDB: one group_id still needs the graph named after that id.
+        # One group_id still needs the database/graph named after that id.
         # Clone is call-scoped so we never reassign self.driver / self.clients.driver.
-        if is_falkor and group_ids and len(group_ids) == 1:
+        if is_database_per_group and group_ids and len(group_ids) == 1:
             gid = group_ids[0]
             driver = self.clients.driver
             if gid != getattr(driver, '_database', None):
@@ -68,8 +70,8 @@ def handle_multiple_group_ids(func: F) -> F:
                 )
             return await func(self, *args, **kwargs)
 
-        # FalkorDB with multiple group_ids: run per graph and merge
-        if is_falkor and group_ids and len(group_ids) > 1:
+        # Database-per-group with multiple group_ids: run per database and merge
+        if is_database_per_group and group_ids and len(group_ids) > 1:
             # Execute for each group_id concurrently
             driver = self.clients.driver
 

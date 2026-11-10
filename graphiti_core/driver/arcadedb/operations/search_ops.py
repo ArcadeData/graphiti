@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import logging
 from typing import Any
 
+from graphiti_core.driver.arcadedb.search_queries import ann_search
 from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.driver.operations.search_ops import SearchOperations
 from graphiti_core.driver.query_executor import QueryExecutor
@@ -27,8 +27,12 @@ from graphiti_core.driver.record_parsers import (
     episodic_node_from_record,
 )
 from graphiti_core.edges import EntityEdge
-from graphiti_core.graph_queries import get_vector_cosine_func_query
-from graphiti_core.helpers import lucene_sanitize
+from graphiti_core.graph_queries import (
+    get_nodes_query,
+    get_relationships_query,
+    get_vector_cosine_func_query,
+)
+from graphiti_core.helpers import validate_group_ids
 from graphiti_core.models.edges.edge_db_queries import get_entity_edge_return_query
 from graphiti_core.models.nodes.node_db_queries import (
     COMMUNITY_NODE_RETURN,
@@ -41,40 +45,19 @@ from graphiti_core.search.search_filters import (
     edge_search_filter_query_constructor,
     node_search_filter_query_constructor,
 )
-
-logger = logging.getLogger(__name__)
-
-MAX_QUERY_LENGTH = 128
-
-
-def _build_arcadedb_fulltext_query(
-    query: str,
-    group_ids: list[str] | None = None,
-    max_query_length: int = MAX_QUERY_LENGTH,
-) -> str:
-    """Build a Lucene query string for ArcadeDB fulltext search."""
-    group_ids_filter_list = [f'group_id:"{g}"' for g in group_ids] if group_ids is not None else []
-    group_ids_filter = ''
-    for f in group_ids_filter_list:
-        group_ids_filter += f if not group_ids_filter else f' OR {f}'
-
-    group_ids_filter += ' AND ' if group_ids_filter else ''
-
-    lucene_query = lucene_sanitize(query)
-    if len(lucene_query.split(' ')) + len(group_ids or '') >= max_query_length:
-        return ''
-
-    full_query = group_ids_filter + '(' + lucene_query + ')'
-    return full_query
+from graphiti_core.search.search_utils import build_lucene_query
 
 
 class ArcadeDBSearchOperations(SearchOperations):
     """Search operations for ArcadeDB.
 
-    ArcadeDB uses Lucene-based fulltext indexes and HNSW vector indexes.
-    Fulltext search uses CONTAINS predicate with Lucene syntax.
-    Vector similarity is computed in Python using numpy after fetching
-    candidate nodes with their embeddings.
+    Fulltext search goes through ``db.index.fulltext.query*`` with the same Lucene query
+    string as the other providers (``group_id:"x" AND (...)``). Node and community
+    similarity use the HNSW vector index (``db.index.vector.queryNodes``) when the
+    executor is an ``ArcadeDBDriver`` with ``use_vector_index`` set, and otherwise score
+    exactly in the query; edge similarity is always exact because ArcadeDB has no
+    relationship ANN procedure. These build the same queries as
+    ``graphiti_core.search.search_utils``, which is the path ``Graphiti.search`` takes.
     """
 
     # --- Node search ---
@@ -87,7 +70,8 @@ class ArcadeDBSearchOperations(SearchOperations):
         group_ids: list[str] | None = None,
         limit: int = 10,
     ) -> list[EntityNode]:
-        fuzzy_query = _build_arcadedb_fulltext_query(query, group_ids)
+        validate_group_ids(group_ids)
+        fuzzy_query = build_lucene_query(query, group_ids)
         if fuzzy_query == '':
             return []
 
@@ -101,39 +85,26 @@ class ArcadeDBSearchOperations(SearchOperations):
 
         filter_query = ''
         if filter_queries:
-            filter_query = ' AND ' + (' AND '.join(filter_queries))
-
-        # Use toLower/CONTAINS for fulltext search (compatible with ArcadeDB Cypher)
-        search_terms = lucene_sanitize(query).split()
-        if not search_terms:
-            return []
-
-        search_clauses = []
-        for i, term in enumerate(search_terms[:5]):
-            param_key = f'term_{i}'
-            filter_params[param_key] = term.lower()
-            search_clauses.append(
-                f'(toLower(n.name) CONTAINS ${param_key}'
-                f' OR toLower(n.summary) CONTAINS ${param_key})'
-            )
-
-        search_query = ' OR '.join(search_clauses)
+            filter_query = ' WHERE ' + (' AND '.join(filter_queries))
 
         cypher = (
-            'MATCH (n:Entity)'
-            + f' WHERE ({search_query})'
+            get_nodes_query(
+                'node_name_and_summary', '$query', limit=limit, provider=GraphProvider.ARCADEDB
+            )
+            + ' YIELD node AS n, score'
             + filter_query
             + """
+            WITH n, score
+            ORDER BY score DESC
+            LIMIT $limit
             RETURN
             """
             + get_entity_node_return_query(GraphProvider.ARCADEDB)
-            + """
-            LIMIT $limit
-            """
         )
 
         records, _, _ = await executor.execute_query(
             cypher,
+            query=fuzzy_query,
             limit=limit,
             routing_='r',
             **filter_params,
@@ -153,6 +124,22 @@ class ArcadeDBSearchOperations(SearchOperations):
         filter_queries, filter_params = node_search_filter_query_constructor(
             search_filter, GraphProvider.ARCADEDB
         )
+
+        if getattr(executor, 'use_vector_index', False):
+            ann_records = await ann_search(
+                executor,
+                label='Entity',
+                alias='n',
+                return_query=get_entity_node_return_query(GraphProvider.ARCADEDB),
+                search_vector=search_vector,
+                filter_queries=filter_queries,
+                filter_params=filter_params,
+                group_ids=group_ids,
+                limit=limit,
+                min_score=min_score,
+            )
+            if ann_records is not None:
+                return [entity_node_from_record(r) for r in ann_records]
 
         if group_ids is not None:
             filter_queries.append('n.group_id IN $group_ids')
@@ -255,7 +242,8 @@ class ArcadeDBSearchOperations(SearchOperations):
         group_ids: list[str] | None = None,
         limit: int = 10,
     ) -> list[EntityEdge]:
-        fuzzy_query = _build_arcadedb_fulltext_query(query, group_ids)
+        validate_group_ids(group_ids)
+        fuzzy_query = build_lucene_query(query, group_ids)
         if fuzzy_query == '':
             return []
 
@@ -269,38 +257,33 @@ class ArcadeDBSearchOperations(SearchOperations):
 
         filter_query = ''
         if filter_queries:
-            filter_query = ' AND ' + (' AND '.join(filter_queries))
-
-        # Use CONTAINS for fulltext search
-        search_terms = lucene_sanitize(query).split()
-        if not search_terms:
-            return []
-
-        search_clauses = []
-        for i, term in enumerate(search_terms[:5]):
-            param_key = f'term_{i}'
-            filter_params[param_key] = term.lower()
-            search_clauses.append(
-                f'(toLower(e.name) CONTAINS ${param_key} OR toLower(e.fact) CONTAINS ${param_key})'
-            )
-
-        search_query = ' OR '.join(search_clauses)
+            filter_query = ' WHERE ' + (' AND '.join(filter_queries))
 
         cypher = (
-            'MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)'
-            + f' WHERE ({search_query})'
+            get_relationships_query(
+                'edge_name_and_fact', limit=limit, provider=GraphProvider.ARCADEDB
+            )
+            + """
+            YIELD relationship AS rel, score
+            WITH rel AS e, score, startNode(rel) AS n, endNode(rel) AS m
+            WHERE n:Entity AND m:Entity
+            WITH e, score, n, m
+            """
             + filter_query
             + """
+            WITH e, score, n, m
             RETURN
             """
             + get_entity_edge_return_query(GraphProvider.ARCADEDB)
             + """
+            ORDER BY score DESC
             LIMIT $limit
             """
         )
 
         records, _, _ = await executor.execute_query(
             cypher,
+            query=fuzzy_query,
             limit=limit,
             routing_='r',
             **filter_params,
@@ -430,7 +413,8 @@ class ArcadeDBSearchOperations(SearchOperations):
         group_ids: list[str] | None = None,
         limit: int = 10,
     ) -> list[EpisodicNode]:
-        fuzzy_query = _build_arcadedb_fulltext_query(query, group_ids)
+        validate_group_ids(group_ids)
+        fuzzy_query = build_lucene_query(query, group_ids)
         if fuzzy_query == '':
             return []
 
@@ -440,34 +424,28 @@ class ArcadeDBSearchOperations(SearchOperations):
             group_filter_query += '\nAND e.group_id IN $group_ids'
             filter_params['group_ids'] = group_ids
 
-        # Use CONTAINS for fulltext search
-        search_terms = lucene_sanitize(query).split()
-        if not search_terms:
-            return []
-
-        search_clauses = []
-        for i, term in enumerate(search_terms[:5]):
-            param_key = f'term_{i}'
-            filter_params[param_key] = term.lower()
-            search_clauses.append(f'toLower(e.content) CONTAINS ${param_key}')
-
-        search_query = ' OR '.join(search_clauses)
-
         cypher = (
-            'MATCH (e:Episodic)'
-            + f' WHERE ({search_query})'
+            get_nodes_query(
+                'episode_content', '$query', limit=limit, provider=GraphProvider.ARCADEDB
+            )
+            + """
+            YIELD node AS episode, score
+            MATCH (e:Episodic)
+            WHERE e.uuid = episode.uuid
+            """
             + group_filter_query
             + """
             RETURN
             """
             + EPISODIC_NODE_RETURN
             + """
+            ORDER BY score DESC
             LIMIT $limit
             """
         )
 
         records, _, _ = await executor.execute_query(
-            cypher, limit=limit, routing_='r', **filter_params
+            cypher, query=fuzzy_query, limit=limit, routing_='r', **filter_params
         )
 
         return [episodic_node_from_record(r) for r in records]
@@ -481,44 +459,38 @@ class ArcadeDBSearchOperations(SearchOperations):
         group_ids: list[str] | None = None,
         limit: int = 10,
     ) -> list[CommunityNode]:
-        fuzzy_query = _build_arcadedb_fulltext_query(query, group_ids)
+        validate_group_ids(group_ids)
+        fuzzy_query = build_lucene_query(query, group_ids)
         if fuzzy_query == '':
             return []
 
         filter_params: dict[str, Any] = {}
         group_filter_query = ''
         if group_ids is not None:
-            group_filter_query = 'AND c.group_id IN $group_ids'
+            group_filter_query = 'WHERE c.group_id IN $group_ids'
             filter_params['group_ids'] = group_ids
 
-        # Use CONTAINS for fulltext search
-        search_terms = lucene_sanitize(query).split()
-        if not search_terms:
-            return []
-
-        search_clauses = []
-        for i, term in enumerate(search_terms[:5]):
-            param_key = f'term_{i}'
-            filter_params[param_key] = term.lower()
-            search_clauses.append(f'toLower(c.name) CONTAINS ${param_key}')
-
-        search_query = ' OR '.join(search_clauses)
-
         cypher = (
-            'MATCH (c:Community)'
-            + f' WHERE ({search_query})'
-            + (' ' + group_filter_query if group_filter_query else '')
+            get_nodes_query(
+                'community_name', '$query', limit=limit, provider=GraphProvider.ARCADEDB
+            )
+            + """
+            YIELD node AS c, score
+            WITH c, score
+            """
+            + group_filter_query
             + """
             RETURN
             """
             + COMMUNITY_NODE_RETURN
             + """
+            ORDER BY score DESC
             LIMIT $limit
             """
         )
 
         records, _, _ = await executor.execute_query(
-            cypher, limit=limit, routing_='r', **filter_params
+            cypher, query=fuzzy_query, limit=limit, routing_='r', **filter_params
         )
 
         return [community_node_from_record(r) for r in records]
@@ -531,6 +503,22 @@ class ArcadeDBSearchOperations(SearchOperations):
         limit: int = 10,
         min_score: float = 0.6,
     ) -> list[CommunityNode]:
+        if getattr(executor, 'use_vector_index', False):
+            ann_records = await ann_search(
+                executor,
+                label='Community',
+                alias='c',
+                return_query=COMMUNITY_NODE_RETURN,
+                search_vector=search_vector,
+                filter_queries=[],
+                filter_params={},
+                group_ids=group_ids,
+                limit=limit,
+                min_score=min_score,
+            )
+            if ann_records is not None:
+                return [community_node_from_record(r) for r in ann_records]
+
         query_params: dict[str, Any] = {}
 
         group_filter_query = ' WHERE c.name_embedding IS NOT NULL'
@@ -691,4 +679,4 @@ class ArcadeDBSearchOperations(SearchOperations):
         group_ids: list[str] | None = None,
         max_query_length: int = 8000,
     ) -> str:
-        return _build_arcadedb_fulltext_query(query, group_ids, max_query_length)
+        return build_lucene_query(query, group_ids, max_query_length=max_query_length)
