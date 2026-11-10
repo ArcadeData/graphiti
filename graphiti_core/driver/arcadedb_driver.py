@@ -141,11 +141,15 @@ class ArcadeDBDriver(GraphDriver):
             write_concurrency: Writers admitted at once per database from this process
                 (``None`` for no limit). ArcadeDB resolves concurrent transactions that
                 touch the same vertices by aborting one, and the Bolt driver's transaction
-                retry then waits (1 s at first) before running it again. Concurrent
-                ``add_episode`` calls often share vertices, so one writer at a time
-                finishes sooner: 8 writers of 25-edge batches measured 2.0-2.6k edges/s
-                gated against 0.5-1.9k ungated (one writer: 2.5k). Writers in other
-                processes are not covered; the retry still handles those.
+                retry then waits (1 s at first) before running it again, so concurrent
+                writers finish later than one at a time: 8 writers of 25-edge batches on
+                20k vertices measured a median 2.5k edges/s at 1 against 1.35k ungated
+                (7 runs each; p95 latency 96-541 ms against 839-2,910 ms). ``1`` also keeps
+                workers that save the same edge from storing it twice: ArcadeDB's ``MERGE``
+                of a relationship is not atomic against a concurrent ``MERGE`` of the same
+                one when its endpoints already have edges (ArcadeData/arcadedb#11482), and
+                a limit above 1 does not prevent that. Writers in other processes are not
+                covered; give the relationship ``uuid`` properties a unique constraint there.
         """
         super().__init__()
         self.client = AsyncGraphDatabase.driver(
