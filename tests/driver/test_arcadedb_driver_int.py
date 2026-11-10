@@ -270,6 +270,44 @@ async def test_similarity_with_label_and_group_filters(driver):
     assert set(uuids) == {n.uuid for n in findings}
 
 
+async def test_filtered_similarity_scans_exactly_only_when_the_window_hid_matches(driver):
+    """Post-filters can starve the ANN candidate window. The exact scan is only worth its cost
+    when the window was full and its weakest candidate still beat min_score; a small tenant or
+    a min_score cut already gave the complete answer."""
+    rng = random.Random(8)
+    query = _axis(0)
+    # 30 plain nodes crowd the 12-candidate window (limit 3 x overfetch 4); the 5 findings
+    # are further away, outside it.
+    for i in range(30):
+        await _entity(f'p{i}', 'G', _unit(rng, query, 0.02)).save(driver)
+    findings = [_entity(f'f{i}', 'G', _unit(rng), ['Entity', 'Finding']) for i in range(5)]
+    for node in findings:
+        await node.save(driver)
+    filters = SearchFilters(node_labels=['Finding'])
+    queries = _record_queries(driver)
+
+    def exact_scans() -> int:
+        return sum('vector.similarity.cosine' in q for q in queries)
+
+    # window full of plain nodes, min_score 0: the findings are only reachable by the scan
+    found = await node_similarity_search(driver, query, filters, ['G'], limit=3, min_score=0.0)
+    assert len(found) == 3
+    assert {n.uuid for n in found} <= {n.uuid for n in findings}
+    assert exact_scans() == 1
+
+    # same window, but min_score already cuts every candidate: nothing beyond can beat it
+    queries.clear()
+    found = await node_similarity_search(driver, query, filters, ['G'], limit=3, min_score=0.999)
+    assert found == []
+    assert exact_scans() == 0
+
+    # the window covers the whole tenant: nothing was left out
+    queries.clear()
+    found = await node_similarity_search(driver, query, filters, ['G'], limit=20, min_score=0.0)
+    assert {n.uuid for n in found} == {n.uuid for n in findings}
+    assert exact_scans() == 0
+
+
 async def test_edge_fulltext_and_similarity_after_a_real_save(driver):
     rng = random.Random(4)
     alice = _entity('Alice', 'G', _unit(rng))

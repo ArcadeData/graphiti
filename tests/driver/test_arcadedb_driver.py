@@ -444,20 +444,46 @@ class TestArcadeDBDriver:
 
     @pytest.mark.asyncio
     @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
-    async def test_ann_search_falls_back_to_exact_when_post_filters_starve_it(self):
+    async def test_ann_search_falls_back_to_exact_only_when_the_candidate_window_hid_matches(self):
         from graphiti_core.driver.arcadedb.search_queries import ann_search
 
-        executor = MagicMock()
-        executor.execute_query = AsyncMock(return_value=([{'uuid': 'a'}], None, None))
+        def executor_for(candidates: int, lowest: float | None) -> MagicMock:
+            async def execute_query(query, **params):
+                if 'count(score)' in query:
+                    return ([{'candidates': candidates, 'lowest': lowest}], None, None)
+                return ([{'uuid': 'a'}], None, None)
+
+            executor = MagicMock()
+            executor.execute_query = AsyncMock(side_effect=execute_query)
+            return executor
+
         kwargs = dict(
             label='Entity', alias='n', return_query='n.uuid AS uuid', search_vector=[1.0],
             filter_params={}, group_ids=['g'], limit=10, min_score=0.6,
         )  # fmt: skip
+        window = 10 * 4  # limit * ARCADEDB_ANN_OVERFETCH
 
-        # group-only: fewer rows than limit is a legitimate answer
+        # no post-filters: fewer rows than limit is a legitimate answer, no second query
+        executor = executor_for(window, 0.9)
         assert await ann_search(executor, filter_queries=[], **kwargs) == [{'uuid': 'a'}]
-        # post-filtered: the candidate window may have missed matches -> exact scan
-        assert await ann_search(executor, filter_queries=['x'], **kwargs) is None
+        assert executor.execute_query.await_count == 1
+
+        # filters starved a full window whose weakest candidate still beats min_score:
+        # better ones may sit beyond it -> exact scan
+        assert await ann_search(executor_for(window, 0.8), filter_queries=['x'], **kwargs) is None
+
+        # full window, but min_score already cut it: nothing beyond can score higher
+        assert await ann_search(executor_for(window, 0.5), filter_queries=['x'], **kwargs) == [
+            {'uuid': 'a'}
+        ]
+
+        # window not full: the index (or the tenant) was exhausted, the answer is complete
+        assert await ann_search(executor_for(12, 0.7), filter_queries=['x'], **kwargs) == [
+            {'uuid': 'a'}
+        ]
+        assert await ann_search(executor_for(0, None), filter_queries=['x'], **kwargs) == [
+            {'uuid': 'a'}
+        ]
 
     @pytest.mark.asyncio
     @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')

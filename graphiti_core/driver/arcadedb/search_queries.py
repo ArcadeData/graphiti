@@ -57,17 +57,29 @@ def ann_query(
     ``group_ids`` when ``by_group`` and whatever ``filter_queries`` reference.
     """
     k = limit * ARCADEDB_ANN_OVERFETCH if filter_queries else limit
-    options = ", {where: 'group_id IN :group_ids'}" if by_group else ''
     where = ' AND '.join(['score > $min_score', *filter_queries])
     query = (
-        f"CALL db.index.vector.queryNodes('{vector_index_name(label)}', $k, "
-        f'$search_vector{options}) '
+        f'{_ann_call(label, by_group)} '
         f'YIELD node AS {alias}, score '
         f'WITH {alias}, score WHERE {where} '
         f'RETURN {return_query} '
         'ORDER BY score DESC LIMIT $limit'
     )
     return cast(LiteralString, query), k
+
+
+def _ann_call(label: str, by_group: bool) -> str:
+    options = ", {where: 'group_id IN :group_ids'}" if by_group else ''
+    return f"CALL db.index.vector.queryNodes('{vector_index_name(label)}', $k, $search_vector{options})"
+
+
+def ann_window_query(*, label: str, by_group: bool) -> LiteralString:
+    """How many candidates the index returns for ``k`` and how weak the last one is.
+
+    Params: ``search_vector``, ``k`` and ``group_ids`` when ``by_group``.
+    """
+    query = f'{_ann_call(label, by_group)} YIELD score RETURN count(score) AS candidates, min(score) AS lowest'
+    return cast(LiteralString, query)
 
 
 async def ann_search(
@@ -122,6 +134,19 @@ async def ann_search(
         raise
 
     if filter_queries and len(records) < limit:
-        return None
+        # Short result. The exact scan can only find more if candidates were left outside the
+        # window: it was full (k candidates) and its weakest one still beats min_score, since
+        # everything beyond it scores lower. Otherwise the index was exhausted (a small tenant)
+        # or min_score ended the list, and the answer is already complete.
+        window, _, _ = await executor.execute_query(
+            ann_window_query(label=label, by_group=group_ids is not None),
+            search_vector=search_vector,
+            k=k,
+            routing_='r',
+            **({'group_ids': group_ids} if group_ids is not None else {}),
+        )
+        candidates, lowest = window[0]['candidates'], window[0]['lowest']
+        if candidates >= k and lowest > min_score:
+            return None
 
     return list(records)
