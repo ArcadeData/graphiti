@@ -496,6 +496,12 @@ Notes:
   (`CREATE CONSTRAINT ... FOR ()-[e:RELATES_TO]-() REQUIRE e.uuid IS UNIQUE`): a concurrent duplicate save then raises
   `neo4j.exceptions.ConstraintError` instead of storing the edge twice, and retrying it matches the existing edge. The
   constraint cannot be created on a database that already holds duplicate uuids.
+- Bulk loads are limited by the Bolt client, not by the server. For a batch of 500 edges with 1024-dimension embeddings,
+  the Neo4j Python driver spends about 200 ms encoding the 4 MB of floats in pure Python and another 120 ms building a
+  debug log line for them (as an argument evaluated even with logging off), while ArcadeDB waits on the socket. The driver
+  removes the second cost for the embeddings it sends. Installing the driver's Rust codec (`pip install neo4j-rust-ext`,
+  which pins the matching `neo4j` version) removes the first: single-writer `add_nodes_and_edges_bulk` went from 1,191 to
+  3,355 edges/s and from 1,388 to 8,007 nodes/s in the benchmark setup.
 - `docker-compose.arcadedb.yml` starts a server for development and tests (HTTP on 2481, Bolt on 7687).
 
 ## Graph Driver Architecture
