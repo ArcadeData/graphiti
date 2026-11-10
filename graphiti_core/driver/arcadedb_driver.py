@@ -74,8 +74,12 @@ ARCADEDB_TYPE_BUCKETS = 16
 ARCADEDB_VERTEX_TYPES = ('Entity', 'Episodic', 'Community', 'Saga')
 ARCADEDB_EDGE_TYPES = ('RELATES_TO', 'MENTIONS', 'HAS_MEMBER', 'HAS_EPISODE', 'NEXT_EPISODE')
 _DATABASE_NAME = re.compile(r'[A-Za-z0-9_-]+')
-# Write gates the current task already holds, so a write nested in another write (a
-# driver.execute_query inside driver.transaction()) does not wait for itself.
+# What ArcadeDB 26.10.x answers to Cypher CREATE FULLTEXT INDEX / CREATE VECTOR INDEX.
+_OLD_SERVER_INDEX_DDL_ERROR = 'Only standard, RANGE and TEXT index types are supported'
+# Write gates the current task holds. A write nested in another write (a driver.execute_query
+# inside driver.transaction()) must not wait for itself. Tasks spawned inside a gated block
+# inherit the marker and so are not gated either: making them wait would deadlock a parent that
+# awaits them, so concurrent writes spawned inside a gated block must go through its transaction.
 _held_write_gates: ContextVar[frozenset[int]] = ContextVar(
     'arcadedb_held_write_gates', default=frozenset()
 )
@@ -486,6 +490,12 @@ class ArcadeDBDriver(GraphDriver):
             try:
                 await self.execute_query(query)
             except Exception as e:
+                if _OLD_SERVER_INDEX_DDL_ERROR in str(e):
+                    raise RuntimeError(
+                        'ArcadeDB 26.11.1 or newer is required: this server rejects the Cypher '
+                        'CREATE FULLTEXT INDEX / CREATE VECTOR INDEX statements Graphiti uses '
+                        f'to build its search indexes ({e}).'
+                    ) from e
                 # Every statement is IF NOT EXISTS, so a failure here is real.
                 logger.warning(f'ArcadeDB index creation failed: {e}\n{query}')
 

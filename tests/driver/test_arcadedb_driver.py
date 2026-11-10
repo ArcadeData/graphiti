@@ -631,6 +631,34 @@ class TestArcadeDBDriver:
             'edge_data': edge_data
         }
 
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_a_server_without_cypher_index_ddl_fails_loudly(self):
+        """ArcadeDB 26.10.x rejects CREATE FULLTEXT / VECTOR INDEX. Swallowing that as a
+        warning left Graphiti running with no search indexes at all."""
+        self.driver._create_types = AsyncMock()
+        old_server = Exception('{message: Only standard, RANGE and TEXT index types are supported}')
+
+        async def execute_query(query, **kwargs):
+            if query.startswith(('CREATE FULLTEXT', 'CREATE VECTOR')):
+                raise old_server
+            return MagicMock()
+
+        self.mock_client.execute_query = AsyncMock(side_effect=execute_query)
+        with pytest.raises(RuntimeError, match='26.11.1 or newer is required'):
+            await self.driver.build_indices_and_constraints()
+
+        # any other failed statement is still only logged, and the build carries on
+        async def flaky(query, **kwargs):
+            if 'relation_uuid' in query:
+                raise Exception('something else went wrong')
+            return MagicMock()
+
+        self.mock_client.execute_query = AsyncMock(side_effect=flaky)
+        with patch('graphiti_core.driver.arcadedb_driver.logger') as mock_logger:
+            await self.driver.build_indices_and_constraints()
+        mock_logger.warning.assert_called_once()
+
     @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
     def test_operations_properties(self):
         """Test that all 11 operation properties are available."""
