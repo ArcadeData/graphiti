@@ -46,16 +46,21 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # ArcadeDB connection parameters
-# Make sure ArcadeDB is running — see https://docs.arcadedb.com/
-# Tested against ArcadeDB 26.9.1. Bolt ships as a server plugin that must be enlisted
-# at startup; it listens on port 7687 by default:
+# Make sure ArcadeDB 26.10.1 or newer is running — see https://docs.arcadedb.com/
+# Bolt ships as a server plugin that must be enlisted at startup; it listens on
+# port 7687 by default:
 #   -Darcadedb.server.plugins=Bolt:com.arcadedb.bolt.BoltProtocolPlugin
+# `docker compose -f docker-compose.arcadedb.yml up -d` starts such a server
+# (Bolt on 7687, HTTP on 2481).
 # Set the environment variables to match your ArcadeDB instance.
 
 arcadedb_uri = os.environ.get('ARCADEDB_URI', 'bolt://localhost:7687')
 arcadedb_user = os.environ.get('ARCADEDB_USER', 'root')
 arcadedb_password = os.environ.get('ARCADEDB_PASSWORD', 'playwithdata')
 arcadedb_database = os.environ.get('ARCADEDB_DATABASE', 'graphiti')
+# HTTP API of the same server (used to pre-create types with a bucket count). Unset: the
+# Bolt host on port 2480.
+arcadedb_http_uri = os.environ.get('ARCADEDB_HTTP_URI')
 
 
 async def main():
@@ -73,10 +78,15 @@ async def main():
         user=arcadedb_user,
         password=arcadedb_password,
         database=arcadedb_database,
+        http_uri=arcadedb_http_uri,
     )
     graphiti = Graphiti(graph_driver=arcadedb_driver)
 
     try:
+        # ArcadeDB does not build its indexes on connect: create the range, fulltext
+        # and vector indexes (idempotent) before adding or searching anything.
+        await graphiti.build_indices_and_constraints()
+
         #################################################
         # ADDING EPISODES
         #################################################
@@ -121,6 +131,18 @@ async def main():
                 'type': EpisodeType.json,
                 'description': 'podcast metadata',
             },
+            {
+                'content': 'Alice Chen works at Acme Corp as an engineer.',
+                'type': EpisodeType.text,
+                'description': 'HR record',
+                'reference_time': datetime(2024, 1, 1, tzinfo=timezone.utc),
+            },
+            {
+                'content': 'Alice Chen left Acme Corp and now works at Globex as an engineer.',
+                'type': EpisodeType.text,
+                'description': 'HR record',
+                'reference_time': datetime(2025, 1, 1, tzinfo=timezone.utc),
+            },
         ]
 
         # Add episodes to the graph
@@ -132,7 +154,7 @@ async def main():
                 else json.dumps(episode['content']),
                 source=episode['type'],
                 source_description=episode['description'],
-                reference_time=datetime.now(timezone.utc),
+                reference_time=episode.get('reference_time', datetime.now(timezone.utc)),
             )
             print(f'Added episode: Freakonomics Radio {i} ({episode["type"].value})')
 
@@ -231,6 +253,23 @@ async def main():
                 for key, value in node.attributes.items():
                     print(f'  {key}: {value}')
             print('---')
+
+        #################################################
+        # TEMPORAL INVALIDATION
+        #################################################
+        # When a new episode contradicts an existing fact,
+        # Graphiti sets invalid_at on the old edge instead
+        # of deleting it.
+        #################################################
+
+        print("\nSearching for: 'Where does Alice Chen work?'")
+        alice_results = await graphiti.search('Where does Alice Chen work?')
+        for result in alice_results:
+            print(f'Fact: {result.fact}')
+            print(f'  valid_at: {result.valid_at}')
+            print(f'  invalid_at: {result.invalid_at}')
+        if not any(result.invalid_at for result in alice_results):
+            print('No fact was invalidated.')
 
     finally:
         #################################################
