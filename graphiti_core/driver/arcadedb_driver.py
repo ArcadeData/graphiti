@@ -84,6 +84,57 @@ _held_write_gates: ContextVar[frozenset[int]] = ContextVar(
     'arcadedb_held_write_gates', default=frozenset()
 )
 
+
+class _FloatVector(list):
+    """A list of floats whose ``repr`` is constant time.
+
+    The Neo4j Python driver builds ``" ".join(map(repr, (query, parameters, extra)))`` for a
+    debug log line on every ``RUN``, as an argument that is evaluated whether or not debug logging
+    is on. For a batch of 500 edges with 1024-dimension embeddings that is ``repr`` of 512,000
+    floats, 118 ms per send, which was most of what the driver spent (the server was idle in a
+    socket read). A ``list`` subclass packs exactly like a list and keeps that out of the way.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return f'<{len(self)} floats>'
+
+
+_VECTOR_MIN_LENGTH = 32
+
+
+def _compact_vectors(value: Any) -> Any:
+    """``value`` with every long list of floats replaced by a ``_FloatVector``.
+
+    Containers are copied only when something inside them changed, so parameters without an
+    embedding come back as they went in.
+    """
+    if isinstance(value, dict):
+        changed: dict[Any, Any] | None = None
+        for key, item in value.items():
+            new = _compact_vectors(item)
+            if new is not item:
+                if changed is None:
+                    changed = dict(value)
+                changed[key] = new
+        return value if changed is None else changed
+    if isinstance(value, _FloatVector):
+        return value
+    if isinstance(value, list):
+        if len(value) >= _VECTOR_MIN_LENGTH and isinstance(value[0], float):
+            return _FloatVector(value)
+        replaced: list[Any] | None = None
+        for index, item in enumerate(value):
+            new = _compact_vectors(item)
+            if new is not item:
+                if replaced is None:
+                    replaced = list(value)
+                replaced[index] = new
+        return value if replaced is None else replaced
+    return value
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -311,7 +362,7 @@ class ArcadeDBDriver(GraphDriver):
         try:
             async with gate:
                 result = await self.client.execute_query(
-                    cypher_query_, parameters_=params, **kwargs
+                    cypher_query_, parameters_=_compact_vectors(params), **kwargs
                 )
         except Exception as e:
             # Parameter values can carry episode content, so only their names are logged.
@@ -525,6 +576,21 @@ class ArcadeDBDriver(GraphDriver):
             raise
 
 
+class _CompactingTransaction:
+    """The Bolt transaction handed to ``execute_write``/``execute_read`` callbacks, with the
+    float vectors in the parameters of ``run`` made cheap to ``repr`` (see ``_FloatVector``);
+    everything else is the wrapped transaction's."""
+
+    def __init__(self, tx: Any):
+        self._tx = tx
+
+    async def run(self, query: str, parameters: Any = None, **kwargs: Any) -> Any:
+        return await self._tx.run(query, _compact_vectors(parameters), **_compact_vectors(kwargs))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._tx, name)
+
+
 class _ArcadeDBTransaction(Transaction):
     """Wraps a Neo4j AsyncTransaction for ArcadeDB Bolt protocol."""
 
@@ -532,7 +598,7 @@ class _ArcadeDBTransaction(Transaction):
         self._tx = tx
 
     async def run(self, query: str, **kwargs: Any) -> Any:
-        return await self._tx.run(query, **kwargs)
+        return await self._tx.run(query, **_compact_vectors(kwargs))
 
 
 class _ArcadeDBSession(GraphDriverSession):
@@ -562,7 +628,7 @@ class _ArcadeDBSession(GraphDriverSession):
 
     async def run(self, query: str, **kwargs: Any) -> Any:
         await self._driver._ensure_database(self._database)
-        return await self._session.run(query, **kwargs)
+        return await self._session.run(query, **_compact_vectors(kwargs))
 
     async def close(self):
         return await self._session.close()
@@ -570,11 +636,15 @@ class _ArcadeDBSession(GraphDriverSession):
     async def execute_write(self, func, *args, **kwargs):
         await self._driver._ensure_database(self._database)
         async with self._driver._write_gate(self._database):
-            return await self._session.execute_write(func, *args, **kwargs)
+            return await self._session.execute_write(
+                lambda tx, *a, **kw: func(_CompactingTransaction(tx), *a, **kw), *args, **kwargs
+            )
 
     async def execute_read(self, func, *args, **kwargs):
         await self._driver._ensure_database(self._database)
-        return await self._session.execute_read(func, *args, **kwargs)
+        return await self._session.execute_read(
+            lambda tx, *a, **kw: func(_CompactingTransaction(tx), *a, **kw), *args, **kwargs
+        )
 
     async def begin_transaction(self, *args, **kwargs):
         await self._driver._ensure_database(self._database)

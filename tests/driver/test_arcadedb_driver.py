@@ -884,3 +884,68 @@ class TestArcadeDBWriteGate:
         tx.commit.assert_awaited_once()
         # the gate was released: the next writer is admitted
         await asyncio.wait_for(driver.execute_query('CREATE (n)'), timeout=2)
+
+
+@unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+class TestCompactVectors:
+    """Long float lists reach the Bolt driver as a list whose repr is constant time."""
+
+    def test_long_float_lists_are_replaced_wherever_they_sit(self):
+        from graphiti_core.driver.arcadedb_driver import _compact_vectors, _FloatVector
+
+        vector = [0.5] * 1024
+        params = {
+            'entity_edges': [{'uuid': 'a', 'fact_embedding': vector, 'episodes': ['x']}],
+            'name_embedding': vector,
+            'small': [0.1] * 8,
+            'ids': ['a', 'b'],
+        }
+
+        out = _compact_vectors(params)
+
+        assert isinstance(out['name_embedding'], _FloatVector)
+        assert isinstance(out['entity_edges'][0]['fact_embedding'], _FloatVector)
+        assert out['entity_edges'][0]['fact_embedding'] == vector
+        # short lists, strings and everything else are the caller's own objects
+        assert out['small'] is params['small'] and out['ids'] is params['ids']
+        assert out['entity_edges'][0]['episodes'] is params['entity_edges'][0]['episodes']
+        # the input is never modified
+        assert type(params['name_embedding']) is list
+        assert type(params['entity_edges'][0]['fact_embedding']) is list
+
+    def test_parameters_without_an_embedding_come_back_untouched(self):
+        from graphiti_core.driver.arcadedb_driver import _compact_vectors
+
+        params = {'uuid': 'a', 'rows': [{'n': 1}, {'n': 2}], 'tags': ['x'], 'nothing': None}
+        assert _compact_vectors(params) is params
+        assert _compact_vectors(None) is None
+        assert _compact_vectors([]) == []
+
+    def test_repr_does_not_walk_the_vector(self):
+        from graphiti_core.driver.arcadedb_driver import _compact_vectors
+
+        class Exploding(float):
+            def __repr__(self):
+                raise AssertionError('repr of an element was evaluated')
+
+        vector = _compact_vectors({'v': [Exploding(1.0)] * 64})['v']
+        assert repr(vector) == '<64 floats>'
+        assert ' '.join(map(repr, ({'v': vector},))) == "{'v': <64 floats>}"
+
+    @pytest.mark.asyncio
+    async def test_the_transaction_given_to_execute_write_compacts_its_parameters(self):
+        from graphiti_core.driver.arcadedb_driver import _CompactingTransaction, _FloatVector
+
+        raw = MagicMock()
+        raw.run = AsyncMock(return_value='result')
+        tx = _CompactingTransaction(raw)
+
+        assert await tx.run('Q', embedding=[0.5] * 64, other=1) == 'result'
+        args, kwargs = raw.run.await_args
+        assert args[0] == 'Q'
+        assert isinstance(kwargs['embedding'], _FloatVector) and kwargs['other'] == 1
+
+        await tx.run('Q', {'rows': [{'v': [0.5] * 64}]})
+        assert isinstance(raw.run.await_args.args[1]['rows'][0]['v'], _FloatVector)
+        # anything else is the wrapped transaction's own
+        assert tx.commit is raw.commit
