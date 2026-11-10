@@ -77,8 +77,7 @@ def _vector_index_unavailable(error: Exception, label: str) -> bool:
     """
     message = str(error)
     return (
-        vector_index_name(label) in message
-        or 'No vector index found' in message
+        f"No vector index found on property 'name_embedding' for type '{label}'" in message
         or f"Type with name '{label}' was not found" in message
     )
 

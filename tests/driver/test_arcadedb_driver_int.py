@@ -517,6 +517,23 @@ async def test_graphiti_group_id_provisions_a_missing_tenant_database(driver):
             _admin(f'drop database {tenant}')
 
 
+async def test_similarity_search_before_the_indexes_exist_falls_back_to_the_exact_scan(database):
+    """No build_indices_and_constraints(): first the Entity type does not exist, then it does
+    but has no vector index. ArcadeDB words those two cases differently; both must fall back
+    to the exact scan instead of raising."""
+    d = _new_driver(database)
+    try:
+        query = _axis(0)
+        assert await node_similarity_search(d, query, SearchFilters(), ['G'], 5, 0.0) == []
+
+        node = _entity('Early', 'G', query)
+        await node.save(d)  # creates the type, still no index
+        found = await node_similarity_search(d, query, SearchFilters(), ['G'], 5, 0.0)
+        assert [n.uuid for n in found] == [node.uuid]
+    finally:
+        await d.close()
+
+
 async def test_reading_an_unknown_group_id_returns_nothing_and_creates_no_database(driver):
     """A search with a mistyped group_id used to create (and index) a database just to find
     nothing in it. Only a write creates a tenant database."""

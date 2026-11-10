@@ -506,10 +506,18 @@ class TestArcadeDBDriver:
         for message in (
             "{message: No vector index found on property 'name_embedding' for type 'Entity'}",
             "{message: Error executing procedure: Type with name 'Entity' was not found}",
-            "Index with name 'Entity[name_embedding]' was not found",
         ):
             executor.execute_query = AsyncMock(side_effect=Exception(message))
             assert await ann_search(executor, **kwargs) is None, message
+
+        # the same errors about another label are somebody else's problem
+        for message in (
+            "{message: No vector index found on property 'name_embedding' for type 'Community'}",
+            "{message: Error executing procedure: Type with name 'Community' was not found}",
+        ):
+            executor.execute_query = AsyncMock(side_effect=Exception(message))
+            with pytest.raises(Exception, match='Community'):
+                await ann_search(executor, **kwargs)
 
     @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
     def test_unknown_vector_quantization_is_rejected(self):
