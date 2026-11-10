@@ -118,6 +118,14 @@ class TestArcadeDBDriver:
         assert cloned._http_uri == self.driver._http_uri
 
     @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def test_clone_maps_the_default_group_id_to_the_constructed_database(self):
+        """Graphiti's default group_id is '' (add_episode without group_id), which names no
+        database; Graphiti then reads with group_ids=[''], and that must reach the
+        database the driver was constructed with, even from another tenant's clone."""
+        assert self.driver.clone('')._database == 'graphiti'
+        assert self.driver.clone('tenant_a').clone('')._database == 'graphiti'
+
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
     def test_clone_session_targets_cloned_database(self):
         """A cloned driver's session() must open on the cloned database."""
         cloned = self.driver.clone('other_tenant')
@@ -269,6 +277,7 @@ class TestArcadeDBDriver:
     async def test_build_indices_and_constraints(self):
         """Test index and constraint building executes queries."""
         self.mock_client.execute_query = AsyncMock(return_value=MagicMock())
+        self.driver._create_types = AsyncMock()
 
         await self.driver.build_indices_and_constraints()
 
@@ -277,9 +286,8 @@ class TestArcadeDBDriver:
 
     @pytest.mark.asyncio
     @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
-    async def test_build_indices_skips_existing(self):
-        """Test that index creation skips already-existing indexes gracefully."""
-        # Simulate some indexes already existing
+    async def test_build_indices_continues_after_a_failed_statement(self):
+        """One failing DDL statement must not stop the remaining ones."""
         call_count = 0
 
         async def execute_with_errors(*args, **kwargs):
@@ -290,9 +298,23 @@ class TestArcadeDBDriver:
             return MagicMock()
 
         self.mock_client.execute_query = execute_with_errors
+        self.driver._create_types = AsyncMock()
 
-        # Should not raise despite some queries failing
         await self.driver.build_indices_and_constraints()
+
+        # every statement was attempted despite the failures
+        from graphiti_core.graph_queries import (
+            get_fulltext_indices,
+            get_range_indices,
+            get_vector_indices,
+        )
+
+        expected = (
+            len(get_range_indices(GraphProvider.ARCADEDB))
+            + len(get_fulltext_indices(GraphProvider.ARCADEDB))
+            + len(get_vector_indices(GraphProvider.ARCADEDB))
+        )
+        assert call_count == expected
 
     @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
     def test_range_indices_use_valid_cypher_syntax(self):
@@ -316,66 +338,266 @@ class TestArcadeDBDriver:
             assert 'FOR (' in query or 'FOR ()-' in query
 
     @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
-    def test_fulltext_indices_are_sql_for_arcadedb(self):
-        """ArcadeDB rejects full-text DDL on the Bolt/Cypher channel ("Only standard,
-        RANGE and TEXT index types are supported"), so these are ArcadeDB SQL
-        statements that the driver runs over the HTTP API instead."""
-        from graphiti_core.driver.driver import GraphProvider
-        from graphiti_core.graph_queries import get_fulltext_indices
-
-        statements = get_fulltext_indices(GraphProvider.ARCADEDB)
-        assert statements, 'ArcadeDB 26.9.1 supports BM25 full-text indexes'
-
-        index_statements = [s for s in statements if s.startswith('CREATE INDEX')]
-        assert len(index_statements) == 4
-        for statement in index_statements:
-            assert 'FULL_TEXT ENGINE LUCENE' in statement
-            # SQL DDL, never Cypher.
-            assert 'FOR (' not in statement
-
-    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
-    def test_fulltext_index_names_match_ddl(self):
-        """The Type[prop,...] identifier used at query time must match the property
-        list the index was actually created on, or the procedure call fails."""
-        from graphiti_core.driver.driver import GraphProvider
+    def test_fulltext_index_names_match_query_names(self):
+        """ArcadeDB addresses a fulltext index by the name given in its DDL, so the
+        name the query builders call must be the name the DDL creates, for nodes and
+        for relationships."""
         from graphiti_core.graph_queries import (
-            ARCADEDB_FULLTEXT_INDEX_PROPERTIES,
-            get_arcadedb_fulltext_index_name,
             get_fulltext_indices,
+            get_nodes_query,
+            get_relationships_query,
         )
 
         statements = get_fulltext_indices(GraphProvider.ARCADEDB)
-        for name in ARCADEDB_FULLTEXT_INDEX_PROPERTIES:
-            index_name = get_arcadedb_fulltext_index_name(name)
-            type_name, properties = ARCADEDB_FULLTEXT_INDEX_PROPERTIES[name]
-            expected_ddl = (
-                f'CREATE INDEX IF NOT EXISTS ON {type_name} '
-                f'({", ".join(properties)}) FULL_TEXT ENGINE LUCENE'
-            )
-            assert expected_ddl in statements, f'no DDL creating {index_name}'
+        assert len(statements) == 4
+        for statement in statements:
+            assert statement.lstrip().startswith('CREATE FULLTEXT INDEX')
+            assert 'IF NOT EXISTS' in statement
+            # tenant scoping is a Lucene `group_id:` clause, so group_id must be indexed
+            assert 'group_id' in statement
+
+        for name in ('node_name_and_summary', 'community_name', 'episode_content'):
+            assert f'CREATE FULLTEXT INDEX {name} ' in ' '.join(statements)
+            assert f'"{name}"' in get_nodes_query(name, '$query', 10, GraphProvider.ARCADEDB)
+
+        assert 'CREATE FULLTEXT INDEX edge_name_and_fact ' in ' '.join(statements)
+        assert '"edge_name_and_fact"' in get_relationships_query(
+            'edge_name_and_fact', 10, GraphProvider.ARCADEDB
+        )
 
     @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
-    def test_fulltext_query_uses_two_arguments(self):
-        """ArcadeDB's procedure takes 2 arguments; Neo4j's {limit: ...} config map
-        is a hard error."""
-        from graphiti_core.driver.driver import GraphProvider
+    def test_fulltext_query_passes_limit_option(self):
+        """The 3-argument form (ArcadeDB 26.10.1+) lets the engine stop at `limit`."""
         from graphiti_core.graph_queries import get_nodes_query, get_relationships_query
 
-        nodes_query = get_nodes_query(
-            'node_name_and_summary', '$query', limit=10, provider=GraphProvider.ARCADEDB
+        assert '{limit: $limit}' in get_nodes_query(
+            'node_name_and_summary', '$query', 10, GraphProvider.ARCADEDB
         )
-        assert nodes_query == (
-            "CALL db.index.fulltext.queryNodes('Entity[name,summary,group_id]', $query)"
+        assert '{limit: $limit}' in get_relationships_query(
+            'edge_name_and_fact', 10, GraphProvider.ARCADEDB
         )
-        assert 'limit' not in nodes_query
 
-        edges_query = get_relationships_query(
-            'edge_name_and_fact', limit=10, provider=GraphProvider.ARCADEDB
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def test_vector_indices(self):
+        from graphiti_core.graph_queries import get_vector_indices
+
+        sized = get_vector_indices(GraphProvider.ARCADEDB, 1024, 'scalar')
+        assert len(sized) == 2  # Entity and Community; relationships have no ANN procedure
+        assert all('CREATE VECTOR INDEX' in s and 'IF NOT EXISTS' in s for s in sized)
+        assert any('FOR (n:Entity) ON n.name_embedding' in s for s in sized)
+        assert any('FOR (n:Community) ON n.name_embedding' in s for s in sized)
+        assert all('`vector.dimensions`: 1024' in s for s in sized)
+        assert all("`vector.quantization.type`: 'scalar'" in s for s in sized)
+        assert all("`vector.similarity_function`: 'cosine'" in s for s in sized)
+
+        # no dimension -> the index sizes itself from the first vector
+        unsized = get_vector_indices(GraphProvider.ARCADEDB)
+        assert all('vector.dimensions' not in s for s in unsized)
+
+        assert get_vector_indices(GraphProvider.NEO4J, 1024) == []
+
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def test_exact_cosine_is_on_the_shared_score_scale(self):
+        """db.index.vector.queryNodes scores (1 + cosine) / 2, like Neo4j's
+        vector.similarity.cosine and FalkorDB; ArcadeDB's own function returns the raw
+        cosine, so min_score would mean something different without the rescale."""
+        from graphiti_core.graph_queries import get_vector_cosine_func_query
+
+        expr = get_vector_cosine_func_query('a', 'b', GraphProvider.ARCADEDB)
+        assert expr == '(1 + vector.similarity.cosine(a, b)) / 2'
+
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def test_ann_query_group_filter_is_pushed_into_the_index_call(self):
+        from graphiti_core.driver.arcadedb.search_queries import ann_query
+
+        query, k = ann_query(
+            label='Entity', alias='n', return_query='n.uuid AS uuid', filter_queries=[],
+            by_group=True, limit=10,
+        )  # fmt: skip
+        assert "queryNodes('Entity[name_embedding]', $k, $search_vector, " in query
+        assert "{where: 'group_id IN :group_ids'}" in query
+        assert k == 10
+        assert query.count('WHERE') == 1
+
+        query, _ = ann_query(
+            label='Entity', alias='n', return_query='n.uuid AS uuid', filter_queries=[],
+            by_group=False, limit=10,
+        )  # fmt: skip
+        assert 'where:' not in query
+
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def test_ann_query_overfetches_and_joins_filters_with_and(self):
+        """Post-call predicates may discard candidates, so ask the index for more, and
+        they share the single WHERE (a second one is a syntax error)."""
+        from graphiti_core.driver.arcadedb.search_queries import (
+            ARCADEDB_ANN_OVERFETCH,
+            ann_query,
         )
-        assert edges_query == (
-            "CALL db.index.fulltext.queryRelationships('RELATES_TO[name,fact,group_id]', $query)"
+
+        query, k = ann_query(
+            label='Entity', alias='n', return_query='n.uuid AS uuid',
+            filter_queries=['list_has_all(n.labels, $labels)'], by_group=True, limit=10,
+        )  # fmt: skip
+        assert k == 10 * ARCADEDB_ANN_OVERFETCH
+        assert query.count('WHERE') == 1
+        assert 'WHERE score > $min_score AND list_has_all(n.labels, $labels)' in query
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_ann_search_falls_back_to_exact_when_post_filters_starve_it(self):
+        from graphiti_core.driver.arcadedb.search_queries import ann_search
+
+        executor = MagicMock()
+        executor.execute_query = AsyncMock(return_value=([{'uuid': 'a'}], None, None))
+        kwargs = dict(
+            label='Entity', alias='n', return_query='n.uuid AS uuid', search_vector=[1.0],
+            filter_params={}, group_ids=['g'], limit=10, min_score=0.6,
+        )  # fmt: skip
+
+        # group-only: fewer rows than limit is a legitimate answer
+        assert await ann_search(executor, filter_queries=[], **kwargs) == [{'uuid': 'a'}]
+        # post-filtered: the candidate window may have missed matches -> exact scan
+        assert await ann_search(executor, filter_queries=['x'], **kwargs) is None
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_ann_search_index_errors_fall_back_but_others_raise(self):
+        from graphiti_core.driver.arcadedb.search_queries import ann_search
+
+        kwargs = dict(
+            label='Entity', alias='n', return_query='n.uuid AS uuid', search_vector=[1.0],
+            filter_queries=[], filter_params={}, group_ids=None, limit=10, min_score=0.6,
+        )  # fmt: skip
+
+        executor = MagicMock()
+        executor.execute_query = AsyncMock(
+            side_effect=Exception("Index with name 'Entity[name_embedding]' was not found")
         )
-        assert 'limit' not in edges_query
+        assert await ann_search(executor, **kwargs) is None
+
+        executor.execute_query = AsyncMock(side_effect=Exception('connection reset'))
+        with pytest.raises(Exception, match='connection reset'):
+            await ann_search(executor, **kwargs)
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_vector_index_ddl_is_skipped_when_disabled(self):
+        self.mock_client.execute_query = AsyncMock(return_value=MagicMock())
+        self.driver._create_types = AsyncMock()
+
+        await self.driver.build_indices_and_constraints()
+        sent = [c.args[0] for c in self.mock_client.execute_query.call_args_list]
+        assert any(q.startswith('CREATE VECTOR INDEX') for q in sent)
+        assert any(q.startswith('CREATE FULLTEXT INDEX') for q in sent)
+
+        self.mock_client.execute_query.reset_mock()
+        self.driver.use_vector_index = False
+        await self.driver.build_indices_and_constraints()
+        sent = [c.args[0] for c in self.mock_client.execute_query.call_args_list]
+        assert not any('VECTOR INDEX' in q for q in sent)
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_types_are_precreated_with_buckets_and_unreachable_http_is_not_fatal(self):
+        import httpx
+
+        posted = []
+
+        async def fake_post(self_, url, json=None, **kwargs):
+            posted.append(json['command'])
+            return httpx.Response(200, request=httpx.Request('POST', url))
+
+        with patch.object(httpx.AsyncClient, 'post', fake_post):
+            await self.driver._create_types()
+        assert 'CREATE VERTEX TYPE Entity IF NOT EXISTS BUCKETS 16' in posted
+        assert 'CREATE EDGE TYPE RELATES_TO IF NOT EXISTS BUCKETS 16' in posted
+
+        # An unreachable HTTP API only costs the bucket count: indexes still get built.
+        self.mock_client.execute_query = AsyncMock(return_value=MagicMock())
+        self.driver._http_uri = 'http://127.0.0.1:1'
+        with patch('graphiti_core.driver.arcadedb_driver.logger') as mock_logger:
+            await self.driver.build_indices_and_constraints()
+        mock_logger.warning.assert_called_once()
+        assert self.mock_client.execute_query.call_count > 0
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_clone_provisions_its_database_once_and_the_primary_never_does(self):
+        """Graphiti clones the driver per group_id; those databases exist nowhere else, so
+        the clone creates and indexes its database on first use, once per process even
+        across clones. The database the driver was constructed with is never touched."""
+        self.mock_client.execute_query = AsyncMock(return_value=MagicMock())
+        order: list[str] = []
+        self.driver._database_exists = AsyncMock(
+            side_effect=lambda db: order.append(f'exists:{db}') or False
+        )
+        self.driver._create_database = AsyncMock(
+            side_effect=lambda db: order.append(f'create:{db}')
+        )
+        self.driver._create_types = AsyncMock(side_effect=lambda: order.append('types'))
+
+        await self.driver.execute_query('RETURN 1')
+        assert order == []
+
+        tenant = self.driver.clone('tenant_a')
+        await tenant.execute_query('RETURN 1')
+        await tenant.execute_query('RETURN 2')
+        await self.driver.clone('tenant_a').execute_query('RETURN 3')
+
+        assert order[:3] == ['exists:tenant_a', 'create:tenant_a', 'types']
+        assert order.count('create:tenant_a') == 1
+        assert self.driver._provisioned == {'graphiti', 'tenant_a'}
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_clone_skips_creating_a_database_that_already_exists(self):
+        self.mock_client.execute_query = AsyncMock(return_value=MagicMock())
+        self.driver._database_exists = AsyncMock(return_value=True)
+        self.driver._create_database = AsyncMock()
+        self.driver._create_types = AsyncMock()
+
+        await self.driver.clone('tenant_a').execute_query('RETURN 1')
+
+        self.driver._create_database.assert_not_called()
+        # indexes are still (idempotently) ensured
+        assert self.mock_client.execute_query.call_count > 0
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_clone_rejects_database_names_that_are_not_plain_identifiers(self):
+        with pytest.raises(ValueError, match='Invalid ArcadeDB database name'):
+            await self.driver.clone('bad; drop database graphiti').execute_query('RETURN 1')
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_creating_a_tenant_database_without_the_http_api_fails_loudly(self):
+        self.driver._http_uri = 'http://127.0.0.1:1'
+        with pytest.raises(RuntimeError, match='could not be created via the HTTP API'):
+            await self.driver._create_database('tenant_a')
+
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    def test_edge_save_passes_endpoints_as_flat_parameters(self):
+        """ArcadeDB plans a MATCH on a nested parameter field ($edge_data.source_uuid) as a label
+        scan with a filter, O(nodes) per save; flat parameters are an index seek."""
+        from graphiti_core.models.edges.edge_db_queries import (
+            get_entity_edge_save_params,
+            get_entity_edge_save_query,
+        )
+
+        edge_data = {'uuid': 'e1', 'source_uuid': 's1', 'target_uuid': 't1', 'fact': 'f'}
+
+        query = get_entity_edge_save_query(GraphProvider.ARCADEDB)
+        assert '$edge_data.' not in query
+        assert get_entity_edge_save_params(GraphProvider.ARCADEDB, edge_data) == {
+            'edge_data': edge_data,
+            'source_uuid': 's1',
+            'target_uuid': 't1',
+            'edge_uuid': 'e1',
+        }
+        # other providers keep their single-parameter form
+        assert get_entity_edge_save_params(GraphProvider.NEO4J, edge_data) == {
+            'edge_data': edge_data
+        }
 
     @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
     def test_operations_properties(self):
