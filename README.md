@@ -480,6 +480,13 @@ Notes:
 - A vector index has a fixed dimension, so one database holds embeddings of one dimension only.
 - Like FalkorDB, each `group_id` is its own database: passing a `group_id` to `add_episode`/`search` creates that
   database and its indexes on first use (this needs `http_uri`).
+- Concurrent writers are admitted one at a time per database (`write_concurrency=1`; `None` lifts the limit).
+  ArcadeDB aborts one of two concurrent transactions that touch the same vertices and the Bolt driver then waits
+  before retrying, so concurrent `add_episode` calls finish sooner this way. It also keeps two workers that save
+  the same edge from storing it twice: ArcadeDB's `MERGE` is not atomic against a concurrent `MERGE` of the same
+  relationship ([ArcadeData/arcadedb#11482](https://github.com/ArcadeData/arcadedb/issues/11482)). The limit is
+  per process, so with several writer processes also create unique constraints on the relationship `uuid`
+  properties.
 - `docker-compose.arcadedb.yml` starts a server for development and tests (HTTP on 2481, Bolt on 7687).
 
 ## Graph Driver Architecture
