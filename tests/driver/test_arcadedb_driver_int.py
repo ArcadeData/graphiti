@@ -262,7 +262,8 @@ async def test_similarity_with_label_and_group_filters(driver):
     assert len(uuids) == 5
     assert set(uuids) <= {n.uuid for n in findings}
 
-    # the fallback path: more is asked of the post-filter than the candidate window holds
+    # asking for every finding: the candidate window (20 x 4) covers the whole tenant, so the
+    # ANN result is already complete (the saturated-window re-scan is tested below)
     uuids = [
         n.uuid
         for n in await node_similarity_search(

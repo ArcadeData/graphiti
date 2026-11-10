@@ -485,12 +485,17 @@ Notes:
   database and its indexes on first use (this needs `http_uri`).
 - Concurrent writers are admitted one at a time per database (`write_concurrency=1`; `None` lifts the limit).
   ArcadeDB aborts one of two concurrent transactions that touch the same vertices and the Bolt driver then waits
-  before retrying, so concurrent `add_episode` calls finish sooner this way (8 writers: median 2.5k vs 1.35k edges/s
-  in the benchmark's stress script). At 1 it also keeps workers that save the same edge from storing it twice, which
-  ArcadeDB's `MERGE` does not prevent against a concurrent `MERGE` of the same relationship when its endpoints already
-  have edges ([ArcadeData/arcadedb#11482](https://github.com/ArcadeData/arcadedb/issues/11482)); a limit above 1 does
-  not. The limit is per process, so with several writer processes also create unique constraints on the relationship
-  `uuid` properties.
+  before retrying, so concurrent batch writes such as `add_episode` finish sooner this way (8 writers: median 2.5k vs
+  1.35k edges/s in the benchmark's stress script). At 1 it also keeps workers that save the same edge from storing it
+  twice, which ArcadeDB's `MERGE` does not prevent against a concurrent `MERGE` of the same relationship when its
+  endpoints already have edges ([ArcadeData/arcadedb#11482](https://github.com/ArcadeData/arcadedb/issues/11482)); a
+  limit above 1 does not. The cost is that many concurrent small independent saves (`EntityNode.save`,
+  `EntityEdge.save`) are serialised too: 8 callers measured 194-286 saves/s against 462-1,198 ungated, so pass
+  `write_concurrency=None` if that pattern dominates and no two workers save the same edge at once. The limit is per
+  process. With several writer processes, create a unique constraint on each relationship `uuid`
+  (`CREATE CONSTRAINT ... FOR ()-[e:RELATES_TO]-() REQUIRE e.uuid IS UNIQUE`): a concurrent duplicate save then raises
+  `neo4j.exceptions.ConstraintError` instead of storing the edge twice, and retrying it matches the existing edge. The
+  constraint cannot be created on a database that already holds duplicate uuids.
 - `docker-compose.arcadedb.yml` starts a server for development and tests (HTTP on 2481, Bolt on 7687).
 
 ## Graph Driver Architecture
