@@ -17,6 +17,7 @@ limitations under the License.
 import logging
 from typing import Any
 
+from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.driver.operations.next_episode_edge_ops import NextEpisodeEdgeOperations
 from graphiti_core.driver.query_executor import QueryExecutor, Transaction
 from graphiti_core.edges import NextEpisodeEdge
@@ -25,6 +26,8 @@ from graphiti_core.helpers import parse_db_date
 from graphiti_core.models.edges.edge_db_queries import (
     NEXT_EPISODE_EDGE_RETURN,
     NEXT_EPISODE_EDGE_SAVE,
+    get_edge_by_uuid_match,
+    get_edges_by_uuids_match,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,10 +80,12 @@ class ArcadeDBNextEpisodeEdgeOperations(NextEpisodeEdgeOperations):
         edge: NextEpisodeEdge,
         tx: Transaction | None = None,
     ) -> None:
-        query = """
-            MATCH (n:Episodic)-[e:NEXT_EPISODE {uuid: $uuid}]->(m:Episodic)
+        query = (
+            get_edge_by_uuid_match(GraphProvider.ARCADEDB, 'NEXT_EPISODE', 'Episodic', 'Episodic')
+            + """
             DELETE e
-        """
+            """
+        )
         if tx is not None:
             await tx.run(query, uuid=edge.uuid)
         else:
@@ -94,11 +99,12 @@ class ArcadeDBNextEpisodeEdgeOperations(NextEpisodeEdgeOperations):
         uuids: list[str],
         tx: Transaction | None = None,
     ) -> None:
-        query = """
-            MATCH (n:Episodic)-[e:NEXT_EPISODE]->(m:Episodic)
-            WHERE e.uuid IN $uuids
+        query = (
+            get_edges_by_uuids_match(GraphProvider.ARCADEDB, 'NEXT_EPISODE', 'Episodic', 'Episodic')
+            + """
             DELETE e
-        """
+            """
+        )
         if tx is not None:
             await tx.run(query, uuids=uuids)
         else:
@@ -110,8 +116,8 @@ class ArcadeDBNextEpisodeEdgeOperations(NextEpisodeEdgeOperations):
         uuid: str,
     ) -> NextEpisodeEdge:
         query = (
-            """
-            MATCH (n:Episodic)-[e:NEXT_EPISODE {uuid: $uuid}]->(m:Episodic)
+            get_edge_by_uuid_match(GraphProvider.ARCADEDB, 'NEXT_EPISODE', 'Episodic', 'Episodic')
+            + """
             RETURN
             """
             + NEXT_EPISODE_EDGE_RETURN
@@ -128,9 +134,8 @@ class ArcadeDBNextEpisodeEdgeOperations(NextEpisodeEdgeOperations):
         uuids: list[str],
     ) -> list[NextEpisodeEdge]:
         query = (
-            """
-            MATCH (n:Episodic)-[e:NEXT_EPISODE]->(m:Episodic)
-            WHERE e.uuid IN $uuids
+            get_edges_by_uuids_match(GraphProvider.ARCADEDB, 'NEXT_EPISODE', 'Episodic', 'Episodic')
+            + """
             RETURN
             """
             + NEXT_EPISODE_EDGE_RETURN

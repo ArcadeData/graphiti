@@ -17,6 +17,7 @@ limitations under the License.
 import logging
 from typing import Any
 
+from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.driver.operations.has_episode_edge_ops import HasEpisodeEdgeOperations
 from graphiti_core.driver.query_executor import QueryExecutor, Transaction
 from graphiti_core.edges import HasEpisodeEdge
@@ -25,6 +26,8 @@ from graphiti_core.helpers import parse_db_date
 from graphiti_core.models.edges.edge_db_queries import (
     HAS_EPISODE_EDGE_RETURN,
     HAS_EPISODE_EDGE_SAVE,
+    get_edge_by_uuid_match,
+    get_edges_by_uuids_match,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,10 +80,12 @@ class ArcadeDBHasEpisodeEdgeOperations(HasEpisodeEdgeOperations):
         edge: HasEpisodeEdge,
         tx: Transaction | None = None,
     ) -> None:
-        query = """
-            MATCH (n:Saga)-[e:HAS_EPISODE {uuid: $uuid}]->(m:Episodic)
+        query = (
+            get_edge_by_uuid_match(GraphProvider.ARCADEDB, 'HAS_EPISODE', 'Saga', 'Episodic')
+            + """
             DELETE e
-        """
+            """
+        )
         if tx is not None:
             await tx.run(query, uuid=edge.uuid)
         else:
@@ -94,11 +99,12 @@ class ArcadeDBHasEpisodeEdgeOperations(HasEpisodeEdgeOperations):
         uuids: list[str],
         tx: Transaction | None = None,
     ) -> None:
-        query = """
-            MATCH (n:Saga)-[e:HAS_EPISODE]->(m:Episodic)
-            WHERE e.uuid IN $uuids
+        query = (
+            get_edges_by_uuids_match(GraphProvider.ARCADEDB, 'HAS_EPISODE', 'Saga', 'Episodic')
+            + """
             DELETE e
-        """
+            """
+        )
         if tx is not None:
             await tx.run(query, uuids=uuids)
         else:
@@ -110,8 +116,8 @@ class ArcadeDBHasEpisodeEdgeOperations(HasEpisodeEdgeOperations):
         uuid: str,
     ) -> HasEpisodeEdge:
         query = (
-            """
-            MATCH (n:Saga)-[e:HAS_EPISODE {uuid: $uuid}]->(m:Episodic)
+            get_edge_by_uuid_match(GraphProvider.ARCADEDB, 'HAS_EPISODE', 'Saga', 'Episodic')
+            + """
             RETURN
             """
             + HAS_EPISODE_EDGE_RETURN
@@ -128,9 +134,8 @@ class ArcadeDBHasEpisodeEdgeOperations(HasEpisodeEdgeOperations):
         uuids: list[str],
     ) -> list[HasEpisodeEdge]:
         query = (
-            """
-            MATCH (n:Saga)-[e:HAS_EPISODE]->(m:Episodic)
-            WHERE e.uuid IN $uuids
+            get_edges_by_uuids_match(GraphProvider.ARCADEDB, 'HAS_EPISODE', 'Saga', 'Episodic')
+            + """
             RETURN
             """
             + HAS_EPISODE_EDGE_RETURN

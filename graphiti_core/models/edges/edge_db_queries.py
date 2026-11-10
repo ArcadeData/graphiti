@@ -387,3 +387,60 @@ NEXT_EPISODE_EDGE_RETURN = """
     m.uuid AS target_node_uuid,
     e.created_at AS created_at
 """
+
+
+def get_edge_match(
+    provider: GraphProvider, rel_type: str, source_label: str = '', target_label: str = ''
+) -> str:
+    """``MATCH (n)-[e:TYPE]->(m)`` binding ``n``, ``e`` and ``m``, with the endpoint labels.
+
+    ArcadeDB gets anonymous endpoints: it only plans its relationship uuid index
+    (``MATCH EDGE BY INDEX``, ~0.4 ms) for a single relationship type with unlabelled
+    endpoints plus ``WHERE e.uuid = ...`` / ``IN``. A label on either endpoint, a
+    ``T1|T2`` union or an inline ``{uuid: ...}`` map is planned as a scan of every node or
+    edge (~100 ms at 20k edges). Each edge type connects one label pair, so the labels carry
+    no information there.
+    """
+    if provider == GraphProvider.ARCADEDB:
+        return f'MATCH (n)-[e:{rel_type}]->(m)'
+    source = f'n:{source_label}' if source_label else 'n'
+    target = f'm:{target_label}' if target_label else 'm'
+    return f'MATCH ({source})-[e:{rel_type}]->({target})'
+
+
+def get_edge_by_uuid_match(
+    provider: GraphProvider, rel_type: str, source_label: str = '', target_label: str = ''
+) -> str:
+    """MATCH clause that binds ``n``, ``e`` and ``m`` to the edge whose uuid is ``$uuid``."""
+    if provider == GraphProvider.ARCADEDB:
+        return f'{get_edge_match(provider, rel_type)}\nWHERE e.uuid = $uuid'
+    source = f'n:{source_label}' if source_label else 'n'
+    target = f'm:{target_label}' if target_label else 'm'
+    return f'MATCH ({source})-[e:{rel_type} {{uuid: $uuid}}]->({target})'
+
+
+def get_edges_by_uuids_match(
+    provider: GraphProvider, rel_type: str, source_label: str = '', target_label: str = ''
+) -> str:
+    """MATCH clause that binds ``n``, ``e`` and ``m`` to the edges whose uuid is in ``$uuids``."""
+    match = get_edge_match(provider, rel_type, source_label, target_label)
+    return f'{match}\nWHERE e.uuid IN $uuids'
+
+
+# Edge types a uuid can belong to when the caller does not know which one it has (delete()).
+ARCADEDB_UUID_DELETE_REL_TYPES = ('MENTIONS', 'RELATES_TO', 'HAS_MEMBER')
+
+
+def get_arcadedb_edge_delete_queries(by_uuids: bool = False) -> list[str]:
+    """One DELETE per edge type.
+
+    ArcadeDB only reaches its relationship uuid index with a single relationship type and
+    anonymous endpoints (``MATCH (n)-[e:T]->(m) WHERE e.uuid = $uuid``); an inline property
+    map, a labelled endpoint or a ``T1|T2|T3`` union each fall back to scanning every edge or
+    every node (~100 ms at 20k edges, against ~0.4 ms for the index).
+    """
+    match = get_edges_by_uuids_match if by_uuids else get_edge_by_uuid_match
+    return [
+        f'{match(GraphProvider.ARCADEDB, rel_type)}\nDELETE e'
+        for rel_type in ARCADEDB_UUID_DELETE_REL_TYPES
+    ]

@@ -531,3 +531,180 @@ async def test_edge_save_endpoints_are_looked_up_through_the_uuid_index(driver):
 
     assert 'NodeIndexSeek' in plan, plan
     assert 'NodeByLabelScan' not in plan, plan
+
+
+EDGE_TYPES = [
+    ('RELATES_TO', 'Entity', 'Entity'),
+    ('MENTIONS', 'Episodic', 'Entity'),
+    ('HAS_MEMBER', 'Community', ''),
+    ('HAS_EPISODE', 'Saga', 'Episodic'),
+    ('NEXT_EPISODE', 'Episodic', 'Episodic'),
+]
+
+
+async def _plan(driver, query: str, **params) -> str:
+    result = await driver.client.execute_query(
+        'PROFILE ' + query, parameters_=params, database_=driver._database
+    )
+    return (result.summary.profile or {}).get('args', {}).get('string-representation', '')
+
+
+@pytest.mark.parametrize(('rel_type', 'source_label', 'target_label'), EDGE_TYPES)
+async def test_edge_lookups_by_uuid_are_planned_as_index_lookups(
+    driver, rel_type, source_label, target_label
+):
+    """Every uuid lookup and delete must seek the edge's uuid index. ArcadeDB scans every edge
+    (or every node) for an inline ``{uuid: $uuid}`` map, a labelled endpoint or a ``T1|T2``
+    union, which costs ~100 ms at 20k edges against ~0.3 ms for the index."""
+    from graphiti_core.models.edges.edge_db_queries import (
+        ARCADEDB_UUID_DELETE_REL_TYPES,
+        get_arcadedb_edge_delete_queries,
+        get_edge_by_uuid_match,
+        get_edges_by_uuids_match,
+    )
+
+    await driver.execute_query(
+        'CREATE (:Entity {uuid: "s"}), (:Entity {uuid: "t"})',
+    )
+    uuids = ('e1', 'e2', 'e3', 'e4') if rel_type in ARCADEDB_UUID_DELETE_REL_TYPES else ('e1', 'e2')
+    for uuid in uuids:
+        await driver.execute_query(
+            f'MATCH (a:Entity {{uuid: "s"}}), (b:Entity {{uuid: "t"}}) '
+            f'CREATE (a)-[:{rel_type} {{uuid: $uuid}}]->(b)',
+            uuid=uuid,
+        )
+
+    one = get_edge_by_uuid_match(driver.provider, rel_type, source_label, target_label)
+    many = get_edges_by_uuids_match(driver.provider, rel_type, source_label, target_label)
+    plan_one = await _plan(driver, one + '\nRETURN e.uuid AS uuid', uuid='e1')
+    plan_many = await _plan(driver, many + '\nRETURN e.uuid AS uuid', uuids=['e1', 'e2'])
+
+    for plan in (plan_one, plan_many):
+        assert 'MATCH EDGE BY INDEX' in plan, plan
+        assert 'ExpandAll' not in plan and 'NodeByLabelScan' not in plan, plan
+
+    # PROFILE executes the statement, so the deletes also prove the rows really go away. The
+    # type-agnostic deletes behind Edge.delete / delete_by_uuids only cover three edge types.
+    deletes = [(one + '\nDELETE e', {'uuid': 'e1'}), (many + '\nDELETE e', {'uuids': ['e2']})]
+    if rel_type in ARCADEDB_UUID_DELETE_REL_TYPES:
+        deletes += [
+            (query, {'uuid': 'e3'})
+            for query in get_arcadedb_edge_delete_queries()
+            if f'[e:{rel_type}]' in query
+        ]
+        deletes += [
+            (query, {'uuids': ['e4']})
+            for query in get_arcadedb_edge_delete_queries(by_uuids=True)
+            if f'[e:{rel_type}]' in query
+        ]
+    for query, params in deletes:
+        assert 'MATCH EDGE BY INDEX' in await _plan(driver, query, **params), query
+    remaining, _, _ = await driver.execute_query(
+        f'MATCH ()-[e:{rel_type}]->() RETURN count(e) AS n', routing_='r'
+    )
+    assert remaining[0]['n'] == 0
+
+
+async def test_edge_uuid_lookups_return_and_delete_every_edge_type(driver):
+    from datetime import datetime, timezone
+
+    from graphiti_core.edges import (
+        CommunityEdge,
+        Edge,
+        EpisodicEdge,
+        HasEpisodeEdge,
+        NextEpisodeEdge,
+    )
+    from graphiti_core.nodes import (
+        CommunityNode,
+        EpisodeType,
+        EpisodicNode,
+        SagaNode,
+    )
+
+    now = datetime.now(timezone.utc)
+    rng = random.Random(5)
+    source, target = _entity('S', 'G', _unit(rng)), _entity('T', 'G', _unit(rng))
+    episode = EpisodicNode(
+        name='ep',
+        group_id='G',
+        source=EpisodeType.text,
+        source_description='d',
+        content='c',
+        valid_at=now,
+    )
+    next_episode = episode.model_copy(update={'uuid': str(uuid4()), 'name': 'ep2'})
+    community = CommunityNode(name='C', group_id='G', summary='s', name_embedding=_unit(rng))
+    saga = SagaNode(name='saga', group_id='G')
+    for node in (source, target, episode, next_episode, community, saga):
+        await node.save(driver)
+
+    entity_edge = EntityEdge(
+        group_id='G',
+        source_node_uuid=source.uuid,
+        target_node_uuid=target.uuid,
+        name='KNOWS',
+        fact='S knows T',
+        fact_embedding=_unit(rng),
+        episodes=[],
+        created_at=now,
+    )
+    others = [
+        EpisodicEdge(
+            group_id='G',
+            source_node_uuid=episode.uuid,
+            target_node_uuid=source.uuid,
+            created_at=now,
+        ),
+        CommunityEdge(
+            group_id='G',
+            source_node_uuid=community.uuid,
+            target_node_uuid=source.uuid,
+            created_at=now,
+        ),
+        HasEpisodeEdge(
+            group_id='G', source_node_uuid=saga.uuid, target_node_uuid=episode.uuid, created_at=now
+        ),
+        NextEpisodeEdge(
+            group_id='G',
+            source_node_uuid=episode.uuid,
+            target_node_uuid=next_episode.uuid,
+            created_at=now,
+        ),
+    ]
+    edges = [entity_edge, *others]
+    for edge in edges:
+        await edge.save(driver)
+
+    for edge in edges:
+        loaded = await type(edge).get_by_uuid(driver, edge.uuid)
+        assert (loaded.uuid, loaded.source_node_uuid, loaded.target_node_uuid) == (
+            edge.uuid,
+            edge.source_node_uuid,
+            edge.target_node_uuid,
+        )
+        assert [e.uuid for e in await type(edge).get_by_uuids(driver, [edge.uuid])] == [edge.uuid]
+
+    reloaded = await EntityEdge.get_by_uuid(driver, entity_edge.uuid)
+    reloaded.fact_embedding = None
+    await reloaded.load_fact_embedding(driver)
+    assert reloaded.fact_embedding == pytest.approx(entity_edge.fact_embedding, abs=1e-6)
+
+    ops = driver.entity_edge_ops
+    assert (await ops.get_by_uuid(driver, entity_edge.uuid)).uuid == entity_edge.uuid
+    assert [e.uuid for e in await ops.get_by_uuids(driver, [entity_edge.uuid])] == [
+        entity_edge.uuid
+    ]
+    await ops.load_embeddings_bulk(driver, [reloaded])
+
+    # Edge.delete / delete_by_uuids are type-agnostic only for these three edge types; the saga
+    # and next-episode edges are deleted by their own classes.
+    await ops.delete(driver, edges[0])
+    await Edge.delete_by_uuids(driver, [edges[1].uuid])
+    await driver.community_edge_ops.delete_by_uuids(driver, [edges[2].uuid])
+    await edges[3].delete(driver)
+    await driver.next_episode_edge_ops.delete(driver, edges[4])
+    remaining, _, _ = await driver.execute_query(
+        'MATCH ()-[e]->() RETURN count(e) AS n', routing_='r'
+    )
+    assert remaining[0]['n'] == 0

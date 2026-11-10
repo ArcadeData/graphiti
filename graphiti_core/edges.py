@@ -37,7 +37,11 @@ from graphiti_core.models.edges.edge_db_queries import (
     HAS_EPISODE_EDGE_SAVE,
     NEXT_EPISODE_EDGE_RETURN,
     NEXT_EPISODE_EDGE_SAVE,
+    get_arcadedb_edge_delete_queries,
     get_community_edge_save_query,
+    get_edge_by_uuid_match,
+    get_edge_match,
+    get_edges_by_uuids_match,
     get_entity_edge_return_query,
     get_entity_edge_save_params,
     get_entity_edge_save_query,
@@ -79,6 +83,9 @@ class Edge(BaseModel, ABC):
                 """,
                 uuid=self.uuid,
             )
+        elif driver.provider == GraphProvider.ARCADEDB:
+            for query in get_arcadedb_edge_delete_queries():
+                await driver.execute_query(query, uuid=self.uuid)
         else:
             await driver.execute_query(
                 """
@@ -117,6 +124,9 @@ class Edge(BaseModel, ABC):
                 """,
                 uuids=uuids,
             )
+        elif driver.provider == GraphProvider.ARCADEDB:
+            for query in get_arcadedb_edge_delete_queries(by_uuids=True):
+                await driver.execute_query(query, uuids=uuids)
         else:
             await driver.execute_query(
                 """
@@ -173,8 +183,8 @@ class EpisodicEdge(Edge):
                 pass
 
         records, _, _ = await driver.execute_query(
-            """
-            MATCH (n:Episodic)-[e:MENTIONS {uuid: $uuid}]->(m:Entity)
+            get_edge_by_uuid_match(driver.provider, 'MENTIONS', 'Episodic', 'Entity')
+            + """
             RETURN
             """
             + EPISODIC_EDGE_RETURN,
@@ -199,9 +209,8 @@ class EpisodicEdge(Edge):
                 pass
 
         records, _, _ = await driver.execute_query(
-            """
-            MATCH (n:Episodic)-[e:MENTIONS]->(m:Entity)
-            WHERE e.uuid IN $uuids
+            get_edges_by_uuids_match(driver.provider, 'MENTIONS', 'Episodic', 'Entity')
+            + """
             RETURN
             """
             + EPISODIC_EDGE_RETURN,
@@ -305,10 +314,12 @@ class EntityEdge(Edge):
             except NotImplementedError:
                 pass
 
-        query = """
-            MATCH (n:Entity)-[e:RELATES_TO {uuid: $uuid}]->(m:Entity)
+        query = (
+            get_edge_by_uuid_match(driver.provider, 'RELATES_TO', 'Entity', 'Entity')
+            + """
             RETURN e.fact_embedding AS fact_embedding
-        """
+            """
+        )
 
         if driver.provider == GraphProvider.NEPTUNE:
             query = """
@@ -383,9 +394,7 @@ class EntityEdge(Edge):
             except NotImplementedError:
                 pass
 
-        match_query = """
-            MATCH (n:Entity)-[e:RELATES_TO {uuid: $uuid}]->(m:Entity)
-        """
+        match_query = get_edge_by_uuid_match(driver.provider, 'RELATES_TO', 'Entity', 'Entity')
         if driver.provider == GraphProvider.KUZU:
             match_query = """
                 MATCH (n:Entity)-[:RELATES_TO]->(e:RelatesToNode_ {uuid: $uuid})-[:RELATES_TO]->(m:Entity)
@@ -455,9 +464,7 @@ class EntityEdge(Edge):
         if len(uuids) == 0:
             return []
 
-        match_query = """
-            MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
-        """
+        match_query = get_edge_match(driver.provider, 'RELATES_TO', 'Entity', 'Entity')
         if driver.provider == GraphProvider.KUZU:
             match_query = """
                 MATCH (n:Entity)-[:RELATES_TO]->(e:RelatesToNode_)-[:RELATES_TO]->(m:Entity)
@@ -605,8 +612,8 @@ class CommunityEdge(Edge):
                 pass
 
         records, _, _ = await driver.execute_query(
-            """
-            MATCH (n:Community)-[e:HAS_MEMBER {uuid: $uuid}]->(m)
+            get_edge_by_uuid_match(driver.provider, 'HAS_MEMBER', 'Community')
+            + """
             RETURN
             """
             + COMMUNITY_EDGE_RETURN,
@@ -629,9 +636,8 @@ class CommunityEdge(Edge):
                 pass
 
         records, _, _ = await driver.execute_query(
-            """
-            MATCH (n:Community)-[e:HAS_MEMBER]->(m)
-            WHERE e.uuid IN $uuids
+            get_edges_by_uuids_match(driver.provider, 'HAS_MEMBER', 'Community')
+            + """
             RETURN
             """
             + COMMUNITY_EDGE_RETURN,
@@ -716,8 +722,8 @@ class HasEpisodeEdge(Edge):
                 pass
 
         await driver.execute_query(
-            """
-            MATCH (n:Saga)-[e:HAS_EPISODE {uuid: $uuid}]->(m:Episodic)
+            get_edge_by_uuid_match(driver.provider, 'HAS_EPISODE', 'Saga', 'Episodic')
+            + """
             DELETE e
             """,
             uuid=self.uuid,
@@ -736,8 +742,8 @@ class HasEpisodeEdge(Edge):
                 pass
 
         records, _, _ = await driver.execute_query(
-            """
-            MATCH (n:Saga)-[e:HAS_EPISODE {uuid: $uuid}]->(m:Episodic)
+            get_edge_by_uuid_match(driver.provider, 'HAS_EPISODE', 'Saga', 'Episodic')
+            + """
             RETURN
             """
             + HAS_EPISODE_EDGE_RETURN,
@@ -762,9 +768,8 @@ class HasEpisodeEdge(Edge):
                 pass
 
         records, _, _ = await driver.execute_query(
-            """
-            MATCH (n:Saga)-[e:HAS_EPISODE]->(m:Episodic)
-            WHERE e.uuid IN $uuids
+            get_edges_by_uuids_match(driver.provider, 'HAS_EPISODE', 'Saga', 'Episodic')
+            + """
             RETURN
             """
             + HAS_EPISODE_EDGE_RETURN,
@@ -851,8 +856,8 @@ class NextEpisodeEdge(Edge):
                 pass
 
         await driver.execute_query(
-            """
-            MATCH (n:Episodic)-[e:NEXT_EPISODE {uuid: $uuid}]->(m:Episodic)
+            get_edge_by_uuid_match(driver.provider, 'NEXT_EPISODE', 'Episodic', 'Episodic')
+            + """
             DELETE e
             """,
             uuid=self.uuid,
@@ -871,8 +876,8 @@ class NextEpisodeEdge(Edge):
                 pass
 
         records, _, _ = await driver.execute_query(
-            """
-            MATCH (n:Episodic)-[e:NEXT_EPISODE {uuid: $uuid}]->(m:Episodic)
+            get_edge_by_uuid_match(driver.provider, 'NEXT_EPISODE', 'Episodic', 'Episodic')
+            + """
             RETURN
             """
             + NEXT_EPISODE_EDGE_RETURN,
@@ -897,9 +902,8 @@ class NextEpisodeEdge(Edge):
                 pass
 
         records, _, _ = await driver.execute_query(
-            """
-            MATCH (n:Episodic)-[e:NEXT_EPISODE]->(m:Episodic)
-            WHERE e.uuid IN $uuids
+            get_edges_by_uuids_match(driver.provider, 'NEXT_EPISODE', 'Episodic', 'Episodic')
+            + """
             RETURN
             """
             + NEXT_EPISODE_EDGE_RETURN,
