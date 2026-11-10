@@ -19,6 +19,7 @@ ARCADEDB_HTTP_URI (see tests/helpers_test.py).
 """
 
 import asyncio
+import contextlib
 import logging
 import os
 import random
@@ -547,6 +548,42 @@ async def test_reading_an_unknown_group_id_returns_nothing_and_creates_no_databa
     finally:
         if exists():
             _admin(f'drop database {tenant}')
+
+
+async def test_graphiti_read_apis_do_not_create_a_database_for_an_unknown_group_id(driver):
+    """Every read has to carry the read hint, or the clone provisions a database for it."""
+    from graphiti_core.edges import EntityEdge as Edge
+    from graphiti_core.errors import GroupsEdgesNotFoundError
+    from graphiti_core.nodes import EpisodicNode
+    from graphiti_core.utils.maintenance.graph_data_operations import retrieve_episodes
+
+    graphiti = Graphiti(
+        graph_driver=driver,
+        llm_client=Mock(spec=LLMClient),
+        embedder=Mock(spec=EmbedderClient),
+        cross_encoder=Mock(spec=CrossEncoderClient),
+    )
+    reads = {
+        'retrieve_episodes': lambda s, t: retrieve_episodes(
+            s, datetime.now(timezone.utc), group_ids=[t]
+        ),
+        'Graphiti.retrieve_episodes': lambda s, t: graphiti.retrieve_episodes(
+            datetime.now(timezone.utc), group_ids=[t]
+        ),
+        'EntityNode.get_by_group_ids': lambda s, t: EntityNode.get_by_group_ids(s, [t]),
+        'EpisodicNode.get_by_group_ids': lambda s, t: EpisodicNode.get_by_group_ids(s, [t]),
+        'EntityEdge.get_by_group_ids': lambda s, t: Edge.get_by_group_ids(s, [t]),
+    }
+    created = []
+    for name, read in reads.items():
+        tenant = f'typo_{uuid4().hex[:8]}'
+        # the edge reader reports an empty result by raising
+        with contextlib.suppress(GroupsEdgesNotFoundError):
+            assert await read(driver.clone(tenant), tenant) == []
+        if httpx.get(f'{ARCADEDB_HTTP_URI}/api/v1/exists/{tenant}', auth=AUTH).json()['result']:
+            created.append(name)
+            _admin(f'drop database {tenant}')
+    assert created == []
 
 
 async def test_fulltext_with_several_group_ids_returns_every_listed_tenant(driver):
