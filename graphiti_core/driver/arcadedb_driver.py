@@ -19,7 +19,8 @@ import copy
 import logging
 import re
 from collections.abc import AsyncIterator, Coroutine
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
+from contextvars import ContextVar
 from typing import Any
 from urllib.parse import urlparse
 
@@ -73,6 +74,11 @@ ARCADEDB_TYPE_BUCKETS = 16
 ARCADEDB_VERTEX_TYPES = ('Entity', 'Episodic', 'Community', 'Saga')
 ARCADEDB_EDGE_TYPES = ('RELATES_TO', 'MENTIONS', 'HAS_MEMBER', 'HAS_EPISODE', 'NEXT_EPISODE')
 _DATABASE_NAME = re.compile(r'[A-Za-z0-9_-]+')
+# Write gates the current task already holds, so a write nested in another write (a
+# driver.execute_query inside driver.transaction()) does not wait for itself.
+_held_write_gates: ContextVar[frozenset[int]] = ContextVar(
+    'arcadedb_held_write_gates', default=frozenset()
+)
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +116,7 @@ class ArcadeDBDriver(GraphDriver):
         vector_quantization: ArcadeDBVectorQuantization = 'none',
         use_vector_index: bool = True,
         buckets: int = ARCADEDB_TYPE_BUCKETS,
+        write_concurrency: int | None = 1,
     ):
         """Connect to ArcadeDB over Bolt.
 
@@ -130,6 +137,14 @@ class ArcadeDBDriver(GraphDriver):
             use_vector_index: ``False`` skips creating the vector indexes and makes node
                 and community similarity search score exactly, in the query.
             buckets: Bucket count for the types pre-created over HTTP.
+            write_concurrency: Writers admitted at once per database from this process
+                (``None`` for no limit). ArcadeDB resolves concurrent transactions that
+                touch the same vertices by aborting one, and the Bolt driver's transaction
+                retry then waits (1 s at first) before running it again. Concurrent
+                ``add_episode`` calls often share vertices, so one writer at a time
+                finishes sooner: 8 writers of 25-edge batches measured 2.0-2.6k edges/s
+                gated against 0.5-1.9k ungated (one writer: 2.5k). Writers in other
+                processes are not covered; the retry still handles those.
         """
         super().__init__()
         self.client = AsyncGraphDatabase.driver(
@@ -151,6 +166,8 @@ class ArcadeDBDriver(GraphDriver):
         self._provisioned: set[str] = {database}
         self._existing: set[str] = set()
         self._provision_lock = asyncio.Lock()
+        self._write_concurrency = write_concurrency
+        self._write_gates: dict[str, asyncio.Semaphore] = {}
 
         # Instantiate ArcadeDB operations
         self._entity_node_ops = ArcadeDBEntityNodeOperations()
@@ -217,7 +234,10 @@ class ArcadeDBDriver(GraphDriver):
     async def transaction(self) -> AsyncIterator[Transaction]:
         """ArcadeDB transaction with real commit/rollback semantics via Bolt."""
         await self._ensure_database()
-        async with self.client.session(database=self._database) as session:
+        async with (
+            self._write_gate(self._database),
+            self.client.session(database=self._database) as session,
+        ):
             tx = await session.begin_transaction()
             try:
                 yield _ArcadeDBTransaction(tx)
@@ -225,6 +245,30 @@ class ArcadeDBDriver(GraphDriver):
             except BaseException:
                 await tx.rollback()
                 raise
+
+    @asynccontextmanager
+    async def _write_gate(self, database: str) -> AsyncIterator[None]:
+        """Admit at most ``write_concurrency`` writers per database from this process.
+
+        A write that already holds the gate (a ``driver.execute_query`` inside
+        ``driver.transaction()``) passes straight through instead of waiting for itself.
+        """
+        if self._write_concurrency is None:
+            yield
+            return
+        gate = self._write_gates.get(database)
+        if gate is None:
+            gate = self._write_gates[database] = asyncio.Semaphore(self._write_concurrency)
+        held = _held_write_gates.get()
+        if id(gate) in held:
+            yield
+            return
+        async with gate:
+            token = _held_write_gates.set(held | {id(gate)})
+            try:
+                yield
+            finally:
+                _held_write_gates.reset(token)
 
     async def execute_query(self, cypher_query_: LiteralString, **kwargs: Any) -> EagerResult:
         params = kwargs.pop('params', None)
@@ -237,8 +281,16 @@ class ArcadeDBDriver(GraphDriver):
         else:
             await self._ensure_database(kwargs['database_'])
 
+        gate = (
+            nullcontext()
+            if kwargs.get('routing_') == 'r'
+            else self._write_gate(kwargs['database_'])
+        )
         try:
-            result = await self.client.execute_query(cypher_query_, parameters_=params, **kwargs)
+            async with gate:
+                result = await self.client.execute_query(
+                    cypher_query_, parameters_=params, **kwargs
+                )
         except Exception as e:
             logger.error(f'Error executing ArcadeDB query: {e}\n{cypher_query_}\n{params}')
             raise
@@ -349,10 +401,7 @@ class ArcadeDBDriver(GraphDriver):
 
     def session(self, database: str | None = None) -> GraphDriverSession:
         _database = database or self._database
-        session = self.client.session(database=_database)
-        if self._auto_provision:
-            return _ProvisioningSession(self, session, _database)
-        return session  # type: ignore
+        return _ArcadeDBSession(self, self.client.session(database=_database), _database)
 
     async def close(self) -> None:
         return await self.client.close()
@@ -455,12 +504,14 @@ class _ArcadeDBTransaction(Transaction):
         return await self._tx.run(query, **kwargs)
 
 
-class _ProvisioningSession(GraphDriverSession):
-    """Session of an auto-provisioning clone: makes sure its database exists first.
+class _ArcadeDBSession(GraphDriverSession):
+    """Session that admits writes through the driver's write gate and, on an
+    auto-provisioning clone, makes sure its database exists first.
 
     ``ArcadeDBDriver.session()`` is synchronous and callers use the session without
-    entering it (``session.execute_write(...)``), so provisioning has to hang off the
-    operations themselves.
+    entering it (``session.execute_write(...)``), so both have to hang off the
+    operations themselves. ``run`` and ``begin_transaction`` hand the work back to the
+    caller, so they are not gated.
     """
 
     provider = GraphProvider.ARCADEDB
@@ -487,7 +538,8 @@ class _ProvisioningSession(GraphDriverSession):
 
     async def execute_write(self, func, *args, **kwargs):
         await self._driver._ensure_database(self._database)
-        return await self._session.execute_write(func, *args, **kwargs)
+        async with self._driver._write_gate(self._database):
+            return await self._session.execute_write(func, *args, **kwargs)
 
     async def execute_read(self, func, *args, **kwargs):
         await self._driver._ensure_database(self._database)

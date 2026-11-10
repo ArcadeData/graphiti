@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import asyncio
 import os
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -213,16 +214,21 @@ class TestArcadeDBDriver:
         with pytest.raises(Exception, match='Connection refused'):
             await self.driver.execute_query('INVALID QUERY')
 
+    @pytest.mark.asyncio
     @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
-    def test_session_creation(self):
-        """Test session creation with default database."""
+    async def test_session_creation(self):
+        """The session is opened on the default database and still reaches the client's."""
         mock_session = MagicMock()
+        mock_session.close = AsyncMock()
+        mock_session.execute_read = AsyncMock(return_value='rows')
         self.mock_client.session.return_value = mock_session
 
         session = self.driver.session()
 
         self.mock_client.session.assert_called_once_with(database='graphiti')
-        assert session is mock_session
+        assert await session.execute_read(lambda tx: None) == 'rows'
+        await session.close()
+        mock_session.close.assert_awaited_once()
 
     @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
     def test_session_creation_with_custom_database(self):
@@ -729,3 +735,93 @@ class TestArcadeDBDriverIntegration:
 
         except Exception as e:
             pytest.skip(f'ArcadeDB not available for integration test: {e}')
+
+
+class TestArcadeDBWriteGate:
+    """Concurrent writers of one process are admitted a few at a time, per database."""
+
+    @staticmethod
+    def _driver(write_concurrency: int | None = 1) -> 'ArcadeDBDriver':
+        with patch('graphiti_core.driver.arcadedb_driver.AsyncGraphDatabase') as mock_agd:
+            mock_agd.driver.return_value = MagicMock()
+            return ArcadeDBDriver(
+                uri='bolt://localhost:7687',
+                user='root',
+                password='x',
+                database='graphiti',
+                write_concurrency=write_concurrency,
+            )
+
+    @staticmethod
+    def _track(driver: 'ArcadeDBDriver') -> dict[str, int]:
+        """Replace the Bolt client; ``peak`` is the most calls ever running at once."""
+        state = {'running': 0, 'peak': 0}
+
+        async def work(*args, **kwargs):
+            state['running'] += 1
+            state['peak'] = max(state['peak'], state['running'])
+            await asyncio.sleep(0.01)
+            state['running'] -= 1
+            return ([], None, [])
+
+        client = MagicMock()
+        client.execute_query = AsyncMock(side_effect=work)
+        session = MagicMock()
+        session.execute_write = AsyncMock(side_effect=work)
+        client.session = MagicMock(return_value=session)
+        driver.client = client
+        return state
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    @pytest.mark.parametrize(('limit', 'expected_peak'), [(1, 1), (3, 3), (None, 8)])
+    async def test_writes_are_admitted_up_to_the_limit(self, limit, expected_peak):
+        driver = self._driver(limit)
+        state = self._track(driver)
+
+        await asyncio.gather(*[driver.execute_query('CREATE (n)') for _ in range(8)])
+        assert state['peak'] == expected_peak
+
+        state['peak'] = 0
+        sessions = [driver.session() for _ in range(8)]
+        await asyncio.gather(*[s.execute_write(lambda tx: None) for s in sessions])
+        assert state['peak'] == expected_peak
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_reads_and_other_databases_are_not_held_up(self):
+        driver = self._driver(1)
+        state = self._track(driver)
+
+        await asyncio.gather(*[driver.execute_query('MATCH (n)', routing_='r') for _ in range(5)])
+        assert state['peak'] == 5
+
+        state['peak'] = 0
+        await asyncio.gather(
+            driver.execute_query('CREATE (n)', database_='tenant_a'),
+            driver.execute_query('CREATE (n)', database_='tenant_b'),
+        )
+        assert state['peak'] == 2
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_a_write_inside_a_transaction_does_not_wait_for_itself(self):
+        driver = self._driver(1)
+        self._track(driver)
+        tx = MagicMock()
+        tx.commit = AsyncMock()
+        tx.rollback = AsyncMock()
+        session = MagicMock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+        session.begin_transaction = AsyncMock(return_value=tx)
+        driver.client.session = MagicMock(return_value=session)
+
+        async def nested():
+            async with driver.transaction():
+                await driver.execute_query('CREATE (n)')
+
+        await asyncio.wait_for(nested(), timeout=2)
+        tx.commit.assert_awaited_once()
+        # the gate was released: the next writer is admitted
+        await asyncio.wait_for(driver.execute_query('CREATE (n)'), timeout=2)
