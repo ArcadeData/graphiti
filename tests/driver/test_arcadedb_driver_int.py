@@ -18,6 +18,7 @@ Each test gets its own throwaway database, created and dropped over the HTTP API
 ARCADEDB_HTTP_URI (see tests/helpers_test.py).
 """
 
+import asyncio
 import logging
 import os
 import random
@@ -780,3 +781,43 @@ async def test_edge_uuid_lookups_return_and_delete_every_edge_type(driver):
         'MATCH ()-[e]->() RETURN count(e) AS n', routing_='r'
     )
     assert remaining[0]['n'] == 0
+
+
+@pytest.mark.parametrize('path', ['EntityEdge.save', 'add_nodes_and_edges_bulk'])
+async def test_concurrent_saves_of_the_same_edge_store_it_once(driver, path):
+    """ArcadeDB's MERGE is not atomic against a concurrent MERGE of the same relationship when
+    its endpoints already have edges (ArcadeData/arcadedb#11482): without the driver's write
+    gate, several workers saving the same edge store it several times, with no error."""
+    from datetime import datetime, timezone
+
+    embedder = Mock(spec=EmbedderClient)
+    rng = random.Random(21)
+    source, target = _entity('S', 'G', _unit(rng)), _entity('T', 'G', _unit(rng))
+    await add_nodes_and_edges_bulk(driver, [], [], [source, target], [], embedder)
+    edges = [
+        EntityEdge(
+            group_id='G',
+            source_node_uuid=source.uuid,
+            target_node_uuid=target.uuid,
+            name='KNOWS',
+            fact=f'fact {i}',
+            fact_embedding=_unit(rng),
+            episodes=[],
+            created_at=datetime.now(timezone.utc),
+        )
+        for i in range(60)
+    ]
+
+    async def save(edge: EntityEdge) -> None:
+        if path == 'EntityEdge.save':
+            await edge.save(driver)
+        else:
+            await add_nodes_and_edges_bulk(driver, [], [], [], [edge], embedder)
+
+    # four workers ingest each fact at the same moment
+    await asyncio.gather(*[save(edge) for edge in edges for _ in range(4)])
+
+    records, _, _ = await driver.execute_query(
+        'MATCH ()-[e:RELATES_TO]->() RETURN e.uuid AS uuid', routing_='r'
+    )
+    assert sorted(r['uuid'] for r in records) == sorted(e.uuid for e in edges)
