@@ -39,6 +39,7 @@ from graphiti_core.models.edges.edge_db_queries import (
     NEXT_EPISODE_EDGE_SAVE,
     get_community_edge_save_query,
     get_entity_edge_return_query,
+    get_entity_edge_save_params,
     get_entity_edge_save_query,
 )
 from graphiti_core.nodes import Node
@@ -367,7 +368,7 @@ class EntityEdge(Edge):
                     edge_data[k] = v
             result = await driver.execute_query(
                 get_entity_edge_save_query(driver.provider),
-                edge_data=edge_data,
+                **get_entity_edge_save_params(driver.provider, edge_data),
             )
 
         logger.debug(f'Saved edge to Graph: {self.uuid}')

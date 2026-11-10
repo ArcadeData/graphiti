@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from typing import Any
+
 from graphiti_core.driver.driver import GraphProvider
 
 EPISODIC_EDGE_SAVE = """
@@ -60,14 +62,31 @@ EPISODIC_EDGE_RETURN = """
 """
 
 
+def get_entity_edge_save_params(
+    provider: GraphProvider, edge_data: dict[str, Any]
+) -> dict[str, Any]:
+    """Query parameters for get_entity_edge_save_query."""
+    params: dict[str, Any] = {'edge_data': edge_data}
+    if provider == GraphProvider.ARCADEDB:
+        params['source_uuid'] = edge_data['source_uuid']
+        params['target_uuid'] = edge_data['target_uuid']
+        params['edge_uuid'] = edge_data['uuid']
+    return params
+
+
 def get_entity_edge_save_query(provider: GraphProvider, has_aoss: bool = False) -> str:
     match provider:
         case GraphProvider.ARCADEDB:
-            # ArcadeDB: embeddings stored as regular properties, no vector API call
+            # ArcadeDB: embeddings stored as regular properties, no vector API call.
+            # The endpoints and the edge uuid are flat parameters (see
+            # get_entity_edge_save_params): ArcadeDB plans
+            # `MATCH (n:Entity {uuid: $edge_data.source_uuid})` as a label scan with a filter
+            # (~35 ms per MATCH at 20k nodes, growing with the node count), while a flat
+            # parameter is a NodeIndexSeek (~1 ms).
             return """
-                MATCH (source:Entity {uuid: $edge_data.source_uuid})
-                MATCH (target:Entity {uuid: $edge_data.target_uuid})
-                MERGE (source)-[e:RELATES_TO {uuid: $edge_data.uuid}]->(target)
+                MATCH (source:Entity {uuid: $source_uuid})
+                MATCH (target:Entity {uuid: $target_uuid})
+                MERGE (source)-[e:RELATES_TO {uuid: $edge_uuid}]->(target)
                 SET e = $edge_data
                 RETURN e.uuid AS uuid
             """

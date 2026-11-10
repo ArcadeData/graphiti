@@ -26,6 +26,7 @@ from graphiti_core.errors import EdgeNotFoundError
 from graphiti_core.models.edges.edge_db_queries import (
     get_entity_edge_return_query,
     get_entity_edge_save_bulk_query,
+    get_entity_edge_save_params,
     get_entity_edge_save_query,
 )
 
@@ -56,10 +57,11 @@ class ArcadeDBEntityEdgeOperations(EntityEdgeOperations):
         edge_data.update(edge.attributes or {})
 
         query = get_entity_edge_save_query(GraphProvider.ARCADEDB)
+        params = get_entity_edge_save_params(GraphProvider.ARCADEDB, edge_data)
         if tx is not None:
-            await tx.run(query, edge_data=edge_data)
+            await tx.run(query, **params)
         else:
-            await executor.execute_query(query, edge_data=edge_data)
+            await executor.execute_query(query, **params)
 
         logger.debug(f'Saved Edge to Graph: {edge.uuid}')
 
