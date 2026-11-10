@@ -498,10 +498,12 @@ Notes:
   constraint cannot be created on a database that already holds duplicate uuids.
 - Bulk loads are limited by the Bolt client, not by the server. For a batch of 500 edges with 1024-dimension embeddings,
   the Neo4j Python driver spends about 200 ms encoding the 4 MB of floats in pure Python and another 120 ms building a
-  debug log line for them (as an argument evaluated even with logging off), while ArcadeDB waits on the socket. The driver
-  removes the second cost for the embeddings it sends. Installing the driver's Rust codec (`pip install neo4j-rust-ext`,
-  which pins the matching `neo4j` version) removes the first: single-writer `add_nodes_and_edges_bulk` went from 1,191 to
-  3,355 edges/s and from 1,388 to 8,007 nodes/s in the benchmark setup.
+  debug log line for them (as an argument evaluated even with logging off), while ArcadeDB waits on the socket. The ArcadeDB
+  driver removes the second cost for the embeddings it sends. The first goes away with the driver's Rust codec:
+  `pip install neo4j-rust-ext==<your neo4j version>.0` (the extension pins the exact `neo4j` release, so it changes the
+  driver version if the two differ). Single-writer `add_nodes_and_edges_bulk` on drivers 6.1.0 and 6.4.1, each with its
+  matching extension, went from 1,163-1,176 to 3,513-3,615 edges/s and from 1,339-1,423 to 7,785-7,889 nodes/s; the
+  unit tests and live ArcadeDB suites pass on both combinations.
 - `docker-compose.arcadedb.yml` starts a server for development and tests (HTTP on 2481, Bolt on 7687).
 
 ## Graph Driver Architecture
