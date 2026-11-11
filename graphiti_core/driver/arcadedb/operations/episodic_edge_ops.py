@@ -26,9 +26,6 @@ from graphiti_core.helpers import parse_db_date
 from graphiti_core.models.edges.edge_db_queries import (
     EPISODIC_EDGE_RETURN,
     EPISODIC_EDGE_SAVE,
-    get_arcadedb_edge_delete_queries,
-    get_edge_by_uuid_match,
-    get_edges_by_uuids_match,
     get_episodic_edge_save_bulk_query,
 )
 
@@ -86,11 +83,14 @@ class ArcadeDBEpisodicEdgeOperations(EpisodicEdgeOperations):
         edge: EpisodicEdge,
         tx: Transaction | None = None,
     ) -> None:
-        for query in get_arcadedb_edge_delete_queries():
-            if tx is not None:
-                await tx.run(query, uuid=edge.uuid)
-            else:
-                await executor.execute_query(query, uuid=edge.uuid)
+        query = """
+            MATCH (n)-[e:MENTIONS|RELATES_TO|HAS_MEMBER {uuid: $uuid}]->(m)
+            DELETE e
+        """
+        if tx is not None:
+            await tx.run(query, uuid=edge.uuid)
+        else:
+            await executor.execute_query(query, uuid=edge.uuid)
 
         logger.debug(f'Deleted Edge: {edge.uuid}')
 
@@ -100,11 +100,15 @@ class ArcadeDBEpisodicEdgeOperations(EpisodicEdgeOperations):
         uuids: list[str],
         tx: Transaction | None = None,
     ) -> None:
-        for query in get_arcadedb_edge_delete_queries(by_uuids=True):
-            if tx is not None:
-                await tx.run(query, uuids=uuids)
-            else:
-                await executor.execute_query(query, uuids=uuids)
+        query = """
+            MATCH (n)-[e:MENTIONS|RELATES_TO|HAS_MEMBER]->(m)
+            WHERE e.uuid IN $uuids
+            DELETE e
+        """
+        if tx is not None:
+            await tx.run(query, uuids=uuids)
+        else:
+            await executor.execute_query(query, uuids=uuids)
 
     async def get_by_uuid(
         self,
@@ -112,8 +116,8 @@ class ArcadeDBEpisodicEdgeOperations(EpisodicEdgeOperations):
         uuid: str,
     ) -> EpisodicEdge:
         query = (
-            get_edge_by_uuid_match(GraphProvider.ARCADEDB, 'MENTIONS', 'Episodic', 'Entity')
-            + """
+            """
+            MATCH (n:Episodic)-[e:MENTIONS {uuid: $uuid}]->(m:Entity)
             RETURN
             """
             + EPISODIC_EDGE_RETURN
@@ -130,8 +134,9 @@ class ArcadeDBEpisodicEdgeOperations(EpisodicEdgeOperations):
         uuids: list[str],
     ) -> list[EpisodicEdge]:
         query = (
-            get_edges_by_uuids_match(GraphProvider.ARCADEDB, 'MENTIONS', 'Episodic', 'Entity')
-            + """
+            """
+            MATCH (n:Episodic)-[e:MENTIONS]->(m:Entity)
+            WHERE e.uuid IN $uuids
             RETURN
             """
             + EPISODIC_EDGE_RETURN

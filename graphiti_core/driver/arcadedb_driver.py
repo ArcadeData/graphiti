@@ -146,10 +146,13 @@ class ArcadeDBDriver(GraphDriver):
     Python async driver for transport while adapting queries for ArcadeDB's
     OpenCypher and SQL dialect.
 
-    Requires ArcadeDB 26.11.1 or newer (Cypher ``CREATE FULLTEXT INDEX`` /
-    ``CREATE VECTOR INDEX``, which 26.10.x rejects, the 3-argument ``db.index.fulltext.query*``
-    procedures and the filtered ``db.index.vector.queryNodes``). The live test suites pass on
-    the released 26.11.1; developed against 26.12.1. The Bolt
+    Requires an ArcadeDB build containing ArcadeData/arcadedb#11486 (26.12.1-SNAPSHOT, build
+    ``601600ee`` or newer): it makes the uuid edge lookups and the nested-parameter edge save
+    that Graphiti sends use the index, and stores a concurrently saved edge once. The Cypher
+    ``CREATE FULLTEXT INDEX`` / ``CREATE VECTOR INDEX`` DDL (which 26.10.x rejects), the
+    3-argument ``db.index.fulltext.query*`` procedures and the filtered
+    ``db.index.vector.queryNodes`` need 26.11.1; on that release everything works but those
+    lookups scan. The Bolt
     plugin must be enlisted at server startup and listens on port 7687 by default::
 
         -Darcadedb.server.plugins=Bolt:com.arcadedb.bolt.BoltProtocolPlugin
@@ -199,20 +202,13 @@ class ArcadeDBDriver(GraphDriver):
                 retry then waits (1 s at first) before running it again, so concurrent
                 batch writers finish later than one at a time: 8 writers of 25-edge
                 batches on 20k vertices measured a median 2.5k edges/s at 1 against 1.35k
-                ungated (7 runs each; p95 latency 96-541 ms against 839-2,910 ms). ``1``
-                also keeps workers that save the same edge from storing it twice:
-                ArcadeDB's ``MERGE`` of a relationship is not atomic against a concurrent
-                ``MERGE`` of the same one when its endpoints already have edges
-                (ArcadeData/arcadedb#11482), and a limit above 1 does not prevent that.
-                The cost: many concurrent small, independent saves are serialised too, so
-                8 callers of ``EntityNode.save`` / ``EntityEdge.save`` on a 10k-node
-                database measured 194-286 saves/s at 1 against 462-1,198 ungated (3
-                runs each; one caller is unaffected). Pass ``None`` if that pattern
-                dominates and no two workers save the same edge at once. Writers in other
-                processes are not covered: give the relationship ``uuid`` properties a
-                unique constraint there, then a concurrent duplicate save raises
-                ``neo4j.exceptions.ConstraintError`` instead of storing the edge twice,
-                and retrying it matches the existing edge.
+                ungated (7 runs each; p95 latency 96-541 ms against 839-2,910 ms). The
+                cost: many concurrent small, independent saves are serialised too, so 8
+                callers of ``EntityNode.save`` / ``EntityEdge.save`` on a 10k-node database
+                measured 0.8-1.0k saves/s at 1 against 2.0-2.6k ungated (3 runs each, on a
+                build with ArcadeData/arcadedb#11486; one caller is unaffected). Pass
+                ``None`` if that pattern dominates. Writers in other processes are not
+                covered.
         """
         super().__init__()
         self.client = AsyncGraphDatabase.driver(

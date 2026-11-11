@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # ArcadeDB connection parameters
-# Make sure ArcadeDB 26.11.1 or newer is running — see https://docs.arcadedb.com/
+# Make sure ArcadeDB 26.12.1-SNAPSHOT build 601600ee or newer is running — see https://docs.arcadedb.com/
 # Bolt ships as a server plugin that must be enlisted at startup; it listens on
 # port 7687 by default:
 #   -Darcadedb.server.plugins=Bolt:com.arcadedb.bolt.BoltProtocolPlugin

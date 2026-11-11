@@ -24,12 +24,8 @@ from graphiti_core.driver.record_parsers import entity_edge_from_record
 from graphiti_core.edges import EntityEdge
 from graphiti_core.errors import EdgeNotFoundError
 from graphiti_core.models.edges.edge_db_queries import (
-    get_arcadedb_edge_delete_queries,
-    get_edge_by_uuid_match,
-    get_edges_by_uuids_match,
     get_entity_edge_return_query,
     get_entity_edge_save_bulk_query,
-    get_entity_edge_save_params,
     get_entity_edge_save_query,
 )
 
@@ -60,11 +56,10 @@ class ArcadeDBEntityEdgeOperations(EntityEdgeOperations):
         edge_data.update(edge.attributes or {})
 
         query = get_entity_edge_save_query(GraphProvider.ARCADEDB)
-        params = get_entity_edge_save_params(GraphProvider.ARCADEDB, edge_data)
         if tx is not None:
-            await tx.run(query, **params)
+            await tx.run(query, edge_data=edge_data)
         else:
-            await executor.execute_query(query, **params)
+            await executor.execute_query(query, edge_data=edge_data)
 
         logger.debug(f'Saved Edge to Graph: {edge.uuid}')
 
@@ -106,11 +101,14 @@ class ArcadeDBEntityEdgeOperations(EntityEdgeOperations):
         edge: EntityEdge,
         tx: Transaction | None = None,
     ) -> None:
-        for query in get_arcadedb_edge_delete_queries():
-            if tx is not None:
-                await tx.run(query, uuid=edge.uuid)
-            else:
-                await executor.execute_query(query, uuid=edge.uuid)
+        query = """
+            MATCH (n)-[e:MENTIONS|RELATES_TO|HAS_MEMBER {uuid: $uuid}]->(m)
+            DELETE e
+        """
+        if tx is not None:
+            await tx.run(query, uuid=edge.uuid)
+        else:
+            await executor.execute_query(query, uuid=edge.uuid)
 
         logger.debug(f'Deleted Edge: {edge.uuid}')
 
@@ -120,24 +118,25 @@ class ArcadeDBEntityEdgeOperations(EntityEdgeOperations):
         uuids: list[str],
         tx: Transaction | None = None,
     ) -> None:
-        for query in get_arcadedb_edge_delete_queries(by_uuids=True):
-            if tx is not None:
-                await tx.run(query, uuids=uuids)
-            else:
-                await executor.execute_query(query, uuids=uuids)
+        query = """
+            MATCH (n)-[e:MENTIONS|RELATES_TO|HAS_MEMBER]->(m)
+            WHERE e.uuid IN $uuids
+            DELETE e
+        """
+        if tx is not None:
+            await tx.run(query, uuids=uuids)
+        else:
+            await executor.execute_query(query, uuids=uuids)
 
     async def get_by_uuid(
         self,
         executor: QueryExecutor,
         uuid: str,
     ) -> EntityEdge:
-        query = (
-            get_edge_by_uuid_match(GraphProvider.ARCADEDB, 'RELATES_TO', 'Entity', 'Entity')
-            + """
+        query = """
+            MATCH (n:Entity)-[e:RELATES_TO {uuid: $uuid}]->(m:Entity)
             RETURN
-            """
-            + get_entity_edge_return_query(GraphProvider.ARCADEDB)
-        )
+            """ + get_entity_edge_return_query(GraphProvider.ARCADEDB)
         records, _, _ = await executor.execute_query(query, uuid=uuid, routing_='r')
         edges = [entity_edge_from_record(r) for r in records]
         if len(edges) == 0:
@@ -151,13 +150,11 @@ class ArcadeDBEntityEdgeOperations(EntityEdgeOperations):
     ) -> list[EntityEdge]:
         if not uuids:
             return []
-        query = (
-            get_edges_by_uuids_match(GraphProvider.ARCADEDB, 'RELATES_TO', 'Entity', 'Entity')
-            + """
+        query = """
+            MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
+            WHERE e.uuid IN $uuids
             RETURN
-            """
-            + get_entity_edge_return_query(GraphProvider.ARCADEDB)
-        )
+            """ + get_entity_edge_return_query(GraphProvider.ARCADEDB)
         records, _, _ = await executor.execute_query(query, uuids=uuids, routing_='r')
         return [entity_edge_from_record(r) for r in records]
 
@@ -229,12 +226,10 @@ class ArcadeDBEntityEdgeOperations(EntityEdgeOperations):
         executor: QueryExecutor,
         edge: EntityEdge,
     ) -> None:
-        query = (
-            get_edge_by_uuid_match(GraphProvider.ARCADEDB, 'RELATES_TO', 'Entity', 'Entity')
-            + """
+        query = """
+            MATCH (n:Entity)-[e:RELATES_TO {uuid: $uuid}]->(m:Entity)
             RETURN e.fact_embedding AS fact_embedding
-            """
-        )
+        """
         records, _, _ = await executor.execute_query(query, uuid=edge.uuid, routing_='r')
         if len(records) == 0:
             raise EdgeNotFoundError(edge.uuid)
@@ -247,13 +242,12 @@ class ArcadeDBEntityEdgeOperations(EntityEdgeOperations):
         batch_size: int = 100,
     ) -> None:
         uuids = [e.uuid for e in edges]
-        query = (
-            get_edges_by_uuids_match(GraphProvider.ARCADEDB, 'RELATES_TO', 'Entity', 'Entity')
-            + """
+        query = """
+            MATCH (n:Entity)-[e:RELATES_TO]-(m:Entity)
+            WHERE e.uuid IN $edge_uuids
             RETURN DISTINCT e.uuid AS uuid, e.fact_embedding AS fact_embedding
-            """
-        )
-        records, _, _ = await executor.execute_query(query, uuids=uuids, routing_='r')
+        """
+        records, _, _ = await executor.execute_query(query, edge_uuids=uuids, routing_='r')
         embedding_map = {r['uuid']: r['fact_embedding'] for r in records}
         for edge in edges:
             if edge.uuid in embedding_map:

@@ -1,8 +1,10 @@
 services:
   arcadedb:
-    image: arcadedata/arcadedb:26.11.1
-    # The oldest release the driver supports (26.10.x lacks Cypher fulltext/vector index DDL).
-    # A release tag is immutable, so CI and local runs see the same server.
+    image: arcadedata/arcadedb@sha256:dc806df8dd02f7667d08b9fcc12923d957a140ab68fd7d383e8399ce8afeb48b
+    # 26.12.1-SNAPSHOT build 601600ee, the first build with ArcadeData/arcadedb#11486 (uuid edge
+    # lookups seek the index, concurrent MERGE of one relationship stores it once). No release has it
+    # yet, so the image is pinned by digest: the snapshot tag moves. Replace it with the first
+    # release that contains the fix.
     container_name: arcadedb-graphiti
     ports:
       - "2481:2480" # HTTP / Studio

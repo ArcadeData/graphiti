@@ -81,13 +81,14 @@ jobs:
             neo4j:5.26-community
           # ArcadeDB serves Bolt from a plugin that has to be enlisted at startup. On the
           # host network its default Bolt port 7687 collides with Neo4j's, so it gets
-          # 7688; 2480 is the HTTP API (database and type creation). 26.11.1 is the oldest
-          # release with Cypher fulltext/vector index DDL, and a release tag cannot move.
+          # 7688; 2480 is the HTTP API (database and type creation). The image is the
+          # 26.12.1-SNAPSHOT build 601600ee, pinned by digest because the first build with
+          # ArcadeData/arcadedb#11486 is not in any release yet and the tag moves.
           docker run -d --name arcadedb --network host \
             -e JAVA_OPTS="-Darcadedb.server.rootPassword=playwithdata \
               -Darcadedb.server.plugins=Bolt:com.arcadedb.bolt.BoltProtocolPlugin \
               -Darcadedb.bolt.port=7688" \
-            arcadedata/arcadedb:26.11.1
+            arcadedata/arcadedb@sha256:dc806df8dd02f7667d08b9fcc12923d957a140ab68fd7d383e8399ce8afeb48b
       - name: Install dependencies
         run: uv sync --all-extras
       - name: Wait for databases

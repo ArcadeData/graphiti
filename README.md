@@ -156,7 +156,7 @@ particularly suitable for applications requiring real-time interaction and preci
 Requirements:
 
 - Python 3.10 or higher
-- Neo4j 5.26 / FalkorDB 1.1.2 / Kuzu 0.11.2 / ArcadeDB 26.11.1+ / Amazon Neptune Database Cluster or Neptune Analytics Graph + Amazon
+- Neo4j 5.26 / FalkorDB 1.1.2 / Kuzu 0.11.2 / ArcadeDB 26.12.1 (build 601600ee or newer) / Amazon Neptune Database Cluster or Neptune Analytics Graph + Amazon
   OpenSearch Serverless collection (serves as the full text search backend)
 - OpenAI API key (Graphiti defaults to OpenAI for LLM inference and embedding)
 
@@ -439,8 +439,12 @@ graphiti = Graphiti(graph_driver=driver)
 
 #### ArcadeDB
 
-ArcadeDB 26.11.1 or newer is required: it is the first release with the Cypher `CREATE FULLTEXT INDEX` /
-`CREATE VECTOR INDEX` DDL (26.10.x rejects it) and the 3-argument `db.index.fulltext.query*` procedures.
+A build containing [ArcadeData/arcadedb#11486](https://github.com/ArcadeData/arcadedb/pull/11486) is
+required (26.12.1-SNAPSHOT, build `601600ee` or newer; no release has it yet). It makes the edge lookups by `uuid`
+that Graphiti sends use the relationship index (`MATCH EDGE BY INDEX`) and stores a concurrently saved edge once. The
+Cypher `CREATE FULLTEXT INDEX` / `CREATE VECTOR INDEX` DDL and the 3-argument `db.index.fulltext.query*` procedures
+need 26.11.1 (26.10.x rejects them), and a 26.11.1 server still works but scans on every uuid lookup and edge save
+(about 44 ms instead of 7 ms per `get_by_uuid` at 20k edges, 100-650 ms instead of 2-4 ms per edge save at 50k nodes).
 
 ```python
 from graphiti_core import Graphiti
@@ -485,17 +489,11 @@ Notes:
   database and its indexes on first use (this needs `http_uri`).
 - Concurrent writers are admitted one at a time per database (`write_concurrency=1`; `None` lifts the limit).
   ArcadeDB aborts one of two concurrent transactions that touch the same vertices and the Bolt driver then waits
-  before retrying, so concurrent batch writes such as `add_episode` finish sooner this way (8 writers: median 2.5k vs
-  1.35k edges/s in the benchmark's stress script). At 1 it also keeps workers that save the same edge from storing it
-  twice, which ArcadeDB's `MERGE` does not prevent against a concurrent `MERGE` of the same relationship when its
-  endpoints already have edges ([ArcadeData/arcadedb#11482](https://github.com/ArcadeData/arcadedb/issues/11482)); a
-  limit above 1 does not. The cost is that many concurrent small independent saves (`EntityNode.save`,
-  `EntityEdge.save`) are serialised too: 8 callers measured 194-286 saves/s against 462-1,198 ungated, so pass
-  `write_concurrency=None` if that pattern dominates and no two workers save the same edge at once. The limit is per
-  process. With several writer processes, create a unique constraint on each relationship `uuid`
-  (`CREATE CONSTRAINT ... FOR ()-[e:RELATES_TO]-() REQUIRE e.uuid IS UNIQUE`): a concurrent duplicate save then raises
-  `neo4j.exceptions.ConstraintError` instead of storing the edge twice, and retrying it matches the existing edge. The
-  constraint cannot be created on a database that already holds duplicate uuids.
+  before retrying, so concurrent batch writes such as `add_episode` finish sooner this way (8 writers, 25-edge batches:
+  2.5-2.9k vs 0.2-0.5k edges/s on the build above). The cost is that many concurrent small independent saves
+  (`EntityNode.save`, `EntityEdge.save`) are serialised too: 8 callers measured 0.8-1.0k saves/s against 2.0-2.6k
+  ungated, so pass `write_concurrency=None` if that pattern dominates. The limit is per process. (Concurrent saves of the
+  same edge no longer need it: the build above stores such an edge once.)
 - Bulk loads are limited by the Bolt client, not by the server. For a batch of 500 edges with 1024-dimension embeddings,
   the Neo4j Python driver spends about 200 ms encoding the 4 MB of floats in pure Python and another 120 ms building a
   debug log line for them (as an argument evaluated even with logging off), while ArcadeDB waits on the socket. The ArcadeDB

@@ -25,10 +25,7 @@ from graphiti_core.errors import EdgeNotFoundError
 from graphiti_core.helpers import parse_db_date
 from graphiti_core.models.edges.edge_db_queries import (
     COMMUNITY_EDGE_RETURN,
-    get_arcadedb_edge_delete_queries,
     get_community_edge_save_query,
-    get_edge_by_uuid_match,
-    get_edges_by_uuids_match,
 )
 
 logger = logging.getLogger(__name__)
@@ -72,11 +69,14 @@ class ArcadeDBCommunityEdgeOperations(CommunityEdgeOperations):
         edge: CommunityEdge,
         tx: Transaction | None = None,
     ) -> None:
-        for query in get_arcadedb_edge_delete_queries():
-            if tx is not None:
-                await tx.run(query, uuid=edge.uuid)
-            else:
-                await executor.execute_query(query, uuid=edge.uuid)
+        query = """
+            MATCH (n)-[e:MENTIONS|RELATES_TO|HAS_MEMBER {uuid: $uuid}]->(m)
+            DELETE e
+        """
+        if tx is not None:
+            await tx.run(query, uuid=edge.uuid)
+        else:
+            await executor.execute_query(query, uuid=edge.uuid)
 
         logger.debug(f'Deleted Edge: {edge.uuid}')
 
@@ -86,11 +86,15 @@ class ArcadeDBCommunityEdgeOperations(CommunityEdgeOperations):
         uuids: list[str],
         tx: Transaction | None = None,
     ) -> None:
-        for query in get_arcadedb_edge_delete_queries(by_uuids=True):
-            if tx is not None:
-                await tx.run(query, uuids=uuids)
-            else:
-                await executor.execute_query(query, uuids=uuids)
+        query = """
+            MATCH (n)-[e:MENTIONS|RELATES_TO|HAS_MEMBER]->(m)
+            WHERE e.uuid IN $uuids
+            DELETE e
+        """
+        if tx is not None:
+            await tx.run(query, uuids=uuids)
+        else:
+            await executor.execute_query(query, uuids=uuids)
 
     async def get_by_uuid(
         self,
@@ -98,8 +102,8 @@ class ArcadeDBCommunityEdgeOperations(CommunityEdgeOperations):
         uuid: str,
     ) -> CommunityEdge:
         query = (
-            get_edge_by_uuid_match(GraphProvider.ARCADEDB, 'HAS_MEMBER', 'Community')
-            + """
+            """
+            MATCH (n:Community)-[e:HAS_MEMBER {uuid: $uuid}]->(m)
             RETURN
             """
             + COMMUNITY_EDGE_RETURN
@@ -116,8 +120,9 @@ class ArcadeDBCommunityEdgeOperations(CommunityEdgeOperations):
         uuids: list[str],
     ) -> list[CommunityEdge]:
         query = (
-            get_edges_by_uuids_match(GraphProvider.ARCADEDB, 'HAS_MEMBER', 'Community')
-            + """
+            """
+            MATCH (n:Community)-[e:HAS_MEMBER]->(m)
+            WHERE e.uuid IN $uuids
             RETURN
             """
             + COMMUNITY_EDGE_RETURN

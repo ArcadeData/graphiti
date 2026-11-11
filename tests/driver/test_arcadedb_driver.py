@@ -638,30 +638,6 @@ class TestArcadeDBDriver:
         with pytest.raises(RuntimeError, match='could not be created via the HTTP API'):
             await self.driver._create_database('tenant_a')
 
-    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
-    def test_edge_save_passes_endpoints_as_flat_parameters(self):
-        """ArcadeDB plans a MATCH on a nested parameter field ($edge_data.source_uuid) as a label
-        scan with a filter, O(nodes) per save; flat parameters are an index seek."""
-        from graphiti_core.models.edges.edge_db_queries import (
-            get_entity_edge_save_params,
-            get_entity_edge_save_query,
-        )
-
-        edge_data = {'uuid': 'e1', 'source_uuid': 's1', 'target_uuid': 't1', 'fact': 'f'}
-
-        query = get_entity_edge_save_query(GraphProvider.ARCADEDB)
-        assert '$edge_data.' not in query
-        assert get_entity_edge_save_params(GraphProvider.ARCADEDB, edge_data) == {
-            'edge_data': edge_data,
-            'source_uuid': 's1',
-            'target_uuid': 't1',
-            'edge_uuid': 'e1',
-        }
-        # other providers keep their single-parameter form
-        assert get_entity_edge_save_params(GraphProvider.NEO4J, edge_data) == {
-            'edge_data': edge_data
-        }
-
     @pytest.mark.asyncio
     @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
     async def test_a_server_without_cypher_index_ddl_fails_loudly(self):

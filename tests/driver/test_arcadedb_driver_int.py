@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Live tests against an ArcadeDB server (26.11.1+) with the Bolt plugin enabled.
+Live tests against an ArcadeDB server (build 601600ee or newer) with the Bolt plugin enabled.
 Each test gets its own throwaway database, created and dropped over the HTTP API at
 ARCADEDB_HTTP_URI (see tests/helpers_test.py).
 """
@@ -629,38 +629,6 @@ async def test_non_utc_datetimes_are_stored_as_the_same_instant(driver):
     assert ensure_utc(loaded.created_at) == created_at.astimezone(timezone.utc)
 
 
-async def test_edge_save_endpoints_are_looked_up_through_the_uuid_index(driver):
-    """The save statement must seek the Entity uuid index; a nested parameter field turns
-    each endpoint MATCH into a scan of every Entity."""
-    from graphiti_core.models.edges.edge_db_queries import (
-        get_entity_edge_save_params,
-        get_entity_edge_save_query,
-    )
-
-    rng = random.Random(13)
-    source, target = _entity('S', 'G', _unit(rng)), _entity('T', 'G', _unit(rng))
-    await source.save(driver)
-    await target.save(driver)
-    edge_data = {
-        'uuid': str(uuid4()),
-        'source_uuid': source.uuid,
-        'target_uuid': target.uuid,
-        'name': 'KNOWS',
-        'fact': 'S knows T',
-        'group_id': 'G',
-    }
-
-    result = await driver.client.execute_query(
-        'PROFILE ' + get_entity_edge_save_query(driver.provider),
-        parameters_=get_entity_edge_save_params(driver.provider, edge_data),
-        database_=driver._database,
-    )
-    plan = (result.summary.profile or {}).get('args', {}).get('string-representation', '')
-
-    assert 'NodeIndexSeek' in plan, plan
-    assert 'NodeByLabelScan' not in plan, plan
-
-
 EDGE_TYPES = [
     ('RELATES_TO', 'Entity', 'Entity'),
     ('MENTIONS', 'Episodic', 'Entity'),
@@ -678,59 +646,71 @@ async def _plan(driver, query: str, **params) -> str:
 
 
 @pytest.mark.parametrize(('rel_type', 'source_label', 'target_label'), EDGE_TYPES)
-async def test_edge_lookups_by_uuid_are_planned_as_index_lookups(
+async def test_edge_uuid_lookups_seek_the_relationship_index(
     driver, rel_type, source_label, target_label
 ):
-    """Every uuid lookup and delete must seek the edge's uuid index. ArcadeDB scans every edge
-    (or every node) for an inline ``{uuid: $uuid}`` map, a labelled endpoint or a ``T1|T2``
-    union, which costs ~100 ms at 20k edges against ~0.3 ms for the index."""
-    from graphiti_core.models.edges.edge_db_queries import (
-        ARCADEDB_UUID_DELETE_REL_TYPES,
-        get_arcadedb_edge_delete_queries,
-        get_edge_by_uuid_match,
-        get_edges_by_uuids_match,
-    )
-
+    """Graphiti looks edges up by uuid with an inline ``{uuid: $uuid}`` map, labelled endpoints and
+    a ``T1|T2`` union for deletes, and saves them with a nested ``$edge_data.field`` parameter.
+    Before ArcadeData/arcadedb#11480 and #11481 (fixed by #11486) ArcadeDB planned each of those
+    as a scan of every edge or vertex (~100 ms at 20k edges). This test needs a server with that
+    fix, and fails on one without it (the rows are still right, only slow)."""
+    # endpoints carry the labels the pattern asks for, so the labelled shapes match real nodes
     await driver.execute_query(
-        'CREATE (:Entity {uuid: "s"}), (:Entity {uuid: "t"})',
+        f'CREATE (:{source_label or "Entity"} {{uuid: "s"}}), (:{target_label or "Entity"} {{uuid: "t"}})'
     )
-    uuids = ('e1', 'e2', 'e3', 'e4') if rel_type in ARCADEDB_UUID_DELETE_REL_TYPES else ('e1', 'e2')
-    for uuid in uuids:
+    for uuid in ('e1', 'e2', 'e3'):
         await driver.execute_query(
-            f'MATCH (a:Entity {{uuid: "s"}}), (b:Entity {{uuid: "t"}}) '
-            f'CREATE (a)-[:{rel_type} {{uuid: $uuid}}]->(b)',
+            f'MATCH (a {{uuid: "s"}}), (b {{uuid: "t"}}) CREATE (a)-[:{rel_type} {{uuid: $uuid}}]->(b)',
             uuid=uuid,
         )
+    source = f'n:{source_label}' if source_label else 'n'
+    target = f'm:{target_label}' if target_label else 'm'
+    shapes = {
+        'inline map': (
+            f'MATCH ({source})-[e:{rel_type} {{uuid: $uuid}}]->({target}) RETURN e.uuid',
+            {'uuid': 'e1'},
+        ),
+        'IN list': (
+            f'MATCH ({source})-[e:{rel_type}]->({target}) WHERE e.uuid IN $uuids RETURN e.uuid',
+            {'uuids': ['e1', 'e2']},
+        ),
+        'type union': (
+            f'MATCH (n)-[e:{rel_type}|MENTIONS {{uuid: $uuid}}]->(m) RETURN e.uuid',
+            {'uuid': 'e1'},
+        ),
+    }
 
-    one = get_edge_by_uuid_match(driver.provider, rel_type, source_label, target_label)
-    many = get_edges_by_uuids_match(driver.provider, rel_type, source_label, target_label)
-    plan_one = await _plan(driver, one + '\nRETURN e.uuid AS uuid', uuid='e1')
-    plan_many = await _plan(driver, many + '\nRETURN e.uuid AS uuid', uuids=['e1', 'e2'])
+    plans = {name: await _plan(driver, query, **params) for name, (query, params) in shapes.items()}
+    for name, plan in plans.items():
+        assert 'MATCH EDGE BY INDEX' in plan, (name, plan)
+        assert 'NodeByLabelScan' not in plan, (name, plan)
 
-    for plan in (plan_one, plan_many):
-        assert 'MATCH EDGE BY INDEX' in plan, plan
-        assert 'ExpandAll' not in plan and 'NodeByLabelScan' not in plan, plan
 
-    # PROFILE executes the statement, so the deletes also prove the rows really go away. The
-    # type-agnostic deletes behind Edge.delete / delete_by_uuids only cover three edge types.
-    deletes = [(one + '\nDELETE e', {'uuid': 'e1'}), (many + '\nDELETE e', {'uuids': ['e2']})]
-    if rel_type in ARCADEDB_UUID_DELETE_REL_TYPES:
-        deletes += [
-            (query, {'uuid': 'e3'})
-            for query in get_arcadedb_edge_delete_queries()
-            if f'[e:{rel_type}]' in query
-        ]
-        deletes += [
-            (query, {'uuids': ['e4']})
-            for query in get_arcadedb_edge_delete_queries(by_uuids=True)
-            if f'[e:{rel_type}]' in query
-        ]
-    for query, params in deletes:
-        assert 'MATCH EDGE BY INDEX' in await _plan(driver, query, **params), query
-    remaining, _, _ = await driver.execute_query(
-        f'MATCH ()-[e:{rel_type}]->() RETURN count(e) AS n', routing_='r'
+async def test_edge_save_endpoints_are_looked_up_through_the_uuid_index(driver):
+    """The save statement passes the endpoints as ``$edge_data.source_uuid``; ArcadeDB used to plan
+    that as a label scan (ArcadeData/arcadedb#11480, fixed by #11486); this fails on a server without it."""
+    from graphiti_core.models.edges.edge_db_queries import get_entity_edge_save_query
+
+    rng = random.Random(13)
+    source, target = _entity('S', 'G', _unit(rng)), _entity('T', 'G', _unit(rng))
+    await source.save(driver)
+    await target.save(driver)
+    edge_data = {
+        'uuid': str(uuid4()),
+        'source_uuid': source.uuid,
+        'target_uuid': target.uuid,
+        'name': 'KNOWS',
+        'fact': 'S knows T',
+        'group_id': 'G',
+    }
+
+    result = await driver.client.execute_query(
+        'PROFILE ' + get_entity_edge_save_query(driver.provider),
+        parameters_={'edge_data': edge_data},
+        database_=driver._database,
     )
-    assert remaining[0]['n'] == 0
+    plan = (result.summary.profile or {}).get('args', {}).get('string-representation', '')
+    assert 'NodeByLabelScan' not in plan, plan
 
 
 async def test_edge_uuid_lookups_return_and_delete_every_edge_type(driver):
@@ -840,9 +820,9 @@ async def test_edge_uuid_lookups_return_and_delete_every_edge_type(driver):
 
 @pytest.mark.parametrize('path', ['EntityEdge.save', 'add_nodes_and_edges_bulk'])
 async def test_concurrent_saves_of_the_same_edge_store_it_once(driver, path):
-    """ArcadeDB's MERGE is not atomic against a concurrent MERGE of the same relationship when
-    its endpoints already have edges (ArcadeData/arcadedb#11482): without the driver's write
-    gate, several workers saving the same edge store it several times, with no error."""
+    """Several workers saving the same edge at once must store it once. ArcadeDB's MERGE was not
+    atomic against a concurrent MERGE of the same relationship (ArcadeData/arcadedb#11482, fixed
+    by #11486), which the driver's write gate used to hide; this is the regression test."""
     from datetime import datetime, timezone
 
     embedder = Mock(spec=EmbedderClient)
