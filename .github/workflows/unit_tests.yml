@@ -79,12 +79,17 @@ jobs:
             -e NEO4J_AUTH=neo4j/testpass \
             -e NEO4J_PLUGINS='["apoc"]' \
             neo4j:5.26-community
-          # ArcadeDB serves Bolt from a plugin that has to be enlisted at startup;
-          # it listens on 7687, while 2480 is the HTTP API used for full-text DDL.
+          # ArcadeDB serves Bolt from a plugin that has to be enlisted at startup. On the
+          # host network its default Bolt port 7687 collides with Neo4j's, so it gets
+          # 7688; 2480 is the HTTP API (database and type creation). The image is the
+          # 26.12.1-SNAPSHOT build 601600ee, pinned by digest because the first build with
+          # ArcadeData/arcadedb#11486 is not in any release yet and the tag moves. A pruned
+          # snapshot manifest would break this job: move to the first release with d5dfeff8ba.
           docker run -d --name arcadedb --network host \
             -e JAVA_OPTS="-Darcadedb.server.rootPassword=playwithdata \
-              -Darcadedb.server.plugins=Bolt:com.arcadedb.bolt.BoltProtocolPlugin" \
-            arcadedata/arcadedb:26.9.1
+              -Darcadedb.server.plugins=Bolt:com.arcadedb.bolt.BoltProtocolPlugin \
+              -Darcadedb.bolt.port=7688" \
+            arcadedata/arcadedb@sha256:dc806df8dd02f7667d08b9fcc12923d957a140ab68fd7d383e8399ce8afeb48b
       - name: Install dependencies
         run: uv sync --all-extras
       - name: Wait for databases
@@ -121,7 +126,7 @@ jobs:
           NEO4J_PASSWORD: testpass
           FALKORDB_HOST: 127.0.0.1
           FALKORDB_PORT: 6379
-          ARCADEDB_URI: bolt://127.0.0.1:7687
+          ARCADEDB_URI: bolt://127.0.0.1:7688
           ARCADEDB_USER: root
           ARCADEDB_PASSWORD: playwithdata
           ARCADEDB_DATABASE: graphiti
@@ -136,3 +141,4 @@ jobs:
             tests/driver/test_falkordb_driver.py \
             tests/driver/test_arcadedb_driver.py \
             -m "not integration"
+          uv run pytest tests/driver/test_arcadedb_driver_int.py -m integration

@@ -122,6 +122,7 @@ async def retrieve_episodes(
             reference_time=reference_time,
             source=source.name if source else None,
             num_episodes=last_n,
+            routing_='r',
         )
 
         episodes = [get_episodic_node_from_record(record) for record in records]
@@ -160,6 +161,7 @@ async def retrieve_episodes(
         query,
         reference_time=reference_time,
         num_episodes=last_n,
+        routing_='r',
         **query_params,
     )
 

@@ -7,7 +7,7 @@ Graphiti's core library lives under `graphiti_core/`, split into domain modules 
 - `make install`: install the dev environment (`uv sync --extra dev`).
 - `make format`: run `ruff` to sort imports and apply the canonical formatter.
 - `make lint`: execute `ruff` plus `pyright` type checks against `graphiti_core`.
-- `make test`: run unit tests only, excluding integration tests and disabling non-Neo4j drivers (`DISABLE_FALKORDB=1 DISABLE_KUZU=1 DISABLE_NEPTUNE=1 uv run pytest -m "not integration"`).
+- `make test`: run unit tests only, excluding integration tests and disabling non-Neo4j drivers (`DISABLE_FALKORDB=1 DISABLE_KUZU=1 DISABLE_NEPTUNE=1 DISABLE_ARCADEDB=1 uv run pytest -m "not integration"`).
 - `make check`: run format, lint, and test in sequence.
 - `uv run pytest tests/path/test_file.py`: target a specific module or test selection.
 - `docker-compose -f docker-compose.test.yml up`: provision local graph/search dependencies for integration flows.

@@ -14,14 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import asyncio
+import copy
 import logging
+import re
 from collections.abc import AsyncIterator, Coroutine
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
+from contextvars import ContextVar
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
 from neo4j import AsyncGraphDatabase, EagerResult
+from neo4j.exceptions import ClientError
 from typing_extensions import LiteralString
 
 from graphiti_core.driver.arcadedb.operations.community_edge_ops import (
@@ -58,7 +63,79 @@ from graphiti_core.driver.operations.next_episode_edge_ops import NextEpisodeEdg
 from graphiti_core.driver.operations.saga_node_ops import SagaNodeOperations
 from graphiti_core.driver.operations.search_ops import SearchOperations
 from graphiti_core.driver.query_executor import Transaction
-from graphiti_core.graph_queries import get_fulltext_indices, get_range_indices
+from graphiti_core.graph_queries import (
+    ArcadeDBVectorQuantization,
+    get_fulltext_indices,
+    get_range_indices,
+    get_vector_indices,
+)
+
+ARCADEDB_TYPE_BUCKETS = 16
+# First version number that is not a release without ArcadeData/arcadedb#11486 (26.11.1 and older).
+ARCADEDB_MIN_FIXED_VERSION = (26, 12, 1)
+ARCADEDB_VERTEX_TYPES = ('Entity', 'Episodic', 'Community', 'Saga')
+ARCADEDB_EDGE_TYPES = ('RELATES_TO', 'MENTIONS', 'HAS_MEMBER', 'HAS_EPISODE', 'NEXT_EPISODE')
+_DATABASE_NAME = re.compile(r'[A-Za-z0-9_-]+')
+# What ArcadeDB 26.10.x answers to Cypher CREATE FULLTEXT INDEX / CREATE VECTOR INDEX.
+_OLD_SERVER_INDEX_DDL_ERROR = 'Only standard, RANGE and TEXT index types are supported'
+# Write gates the current task holds. A write nested in another write (a driver.execute_query
+# inside driver.transaction()) must not wait for itself. Tasks spawned inside a gated block
+# inherit the marker and so are not gated either: making them wait would deadlock a parent that
+# awaits them, so concurrent writes spawned inside a gated block must go through its transaction.
+_held_write_gates: ContextVar[frozenset[int]] = ContextVar(
+    'arcadedb_held_write_gates', default=frozenset()
+)
+
+
+class _FloatVector(list):
+    """A list of floats whose ``repr`` is constant time.
+
+    The Neo4j Python driver builds ``" ".join(map(repr, (query, parameters, extra)))`` for a
+    debug log line on every ``RUN``, as an argument that is evaluated whether or not debug logging
+    is on. For a batch of 500 edges with 1024-dimension embeddings that is ``repr`` of 512,000
+    floats, 118 ms per send, which was most of what the driver spent (the server was idle in a
+    socket read). A ``list`` subclass packs exactly like a list and keeps that out of the way.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return f'<{len(self)} floats>'
+
+
+_VECTOR_MIN_LENGTH = 32
+
+
+def _compact_vectors(value: Any) -> Any:
+    """``value`` with every long list of floats replaced by a ``_FloatVector``.
+
+    Containers are copied only when something inside them changed, so parameters without an
+    embedding come back as they went in.
+    """
+    if isinstance(value, dict):
+        changed: dict[Any, Any] | None = None
+        for key, item in value.items():
+            new = _compact_vectors(item)
+            if new is not item:
+                if changed is None:
+                    changed = dict(value)
+                changed[key] = new
+        return value if changed is None else changed
+    if isinstance(value, _FloatVector):
+        return value
+    if isinstance(value, list):
+        if len(value) >= _VECTOR_MIN_LENGTH and isinstance(value[0], float):
+            return _FloatVector(value)
+        replaced: list[Any] | None = None
+        for index, item in enumerate(value):
+            new = _compact_vectors(item)
+            if new is not item:
+                if replaced is None:
+                    replaced = list(value)
+                replaced[index] = new
+        return value if replaced is None else replaced
+    return value
+
 
 logger = logging.getLogger(__name__)
 
@@ -71,8 +148,14 @@ class ArcadeDBDriver(GraphDriver):
     Python async driver for transport while adapting queries for ArcadeDB's
     OpenCypher and SQL dialect.
 
-    Tested against ArcadeDB 26.9.1. The Bolt plugin must be enlisted at server
-    startup and listens on port 7687 by default::
+    Requires an ArcadeDB build containing ArcadeData/arcadedb#11486 (26.12.1-SNAPSHOT, build
+    ``601600ee`` or newer): it makes the uuid edge lookups and the nested-parameter edge save
+    that Graphiti sends use the index, and stores a concurrently saved edge once. The Cypher
+    ``CREATE FULLTEXT INDEX`` / ``CREATE VECTOR INDEX`` DDL (which 26.10.x rejects), the
+    3-argument ``db.index.fulltext.query*`` procedures and the filtered
+    ``db.index.vector.queryNodes`` need 26.11.1; on that release everything works but those
+    lookups scan. The Bolt
+    plugin must be enlisted at server startup and listens on port 7687 by default::
 
         -Darcadedb.server.plugins=Bolt:com.arcadedb.bolt.BoltProtocolPlugin
     """
@@ -90,6 +173,11 @@ class ArcadeDBDriver(GraphDriver):
         password: str | None,
         database: str = 'graphiti',
         http_uri: str | None = None,
+        embedding_dim: int | None = None,
+        vector_quantization: ArcadeDBVectorQuantization = 'none',
+        use_vector_index: bool = True,
+        buckets: int = ARCADEDB_TYPE_BUCKETS,
+        write_concurrency: int | None = 1,
     ):
         """Connect to ArcadeDB over Bolt.
 
@@ -99,11 +187,30 @@ class ArcadeDBDriver(GraphDriver):
             password: Password.
             database: Database name.
             http_uri: Base URI of ArcadeDB's HTTP API, e.g. ``http://localhost:2480``.
-                Only used to create full-text indexes, which the Bolt/Cypher channel
-                cannot express. Defaults to the Bolt host on port 2480. Pass this
-                explicitly if the HTTP API is on a different host or port; if it is
-                unreachable, full-text indexes are skipped with a warning and
-                full-text search will return no results.
+                Only used to pre-create types with ``BUCKETS`` (no Cypher form).
+                Defaults to the Bolt host on port 2480. If it is unreachable a warning
+                is logged and types are created implicitly with the default bucket
+                count; nothing else depends on it.
+            embedding_dim: Dimension of the node embeddings for the HNSW vector index.
+                ``None`` lets the index size itself from the first vector written.
+            vector_quantization: ``'none'``, ``'scalar'`` or ``'binary'`` quantization of
+                the vector index (memory vs. recall).
+            use_vector_index: ``False`` skips creating the vector indexes and makes node
+                and community similarity search score exactly, in the query.
+            buckets: Bucket count for the types pre-created over HTTP.
+            write_concurrency: Writers admitted at once per database from this process
+                (``None`` for no limit). ArcadeDB resolves concurrent transactions that
+                touch the same vertices by aborting one, and the Bolt driver's transaction
+                retry then waits (1 s at first) before running it again, so concurrent
+                batch writers finish later than one at a time: 8 writers of 25-edge
+                batches on 20k vertices measured a median 2.5k edges/s at 1 against 1.35k
+                ungated (7 runs each; p95 latency 96-541 ms against 839-2,910 ms). The
+                cost: many concurrent small, independent saves are serialised too, so 8
+                callers of ``EntityNode.save`` / ``EntityEdge.save`` on a 10k-node database
+                measured 0.8-1.0k saves/s at 1 against 2.0-2.6k ungated (3 runs each, on a
+                build with ArcadeData/arcadedb#11486; one caller is unaffected). Pass
+                ``None`` if that pattern dominates. Writers in other processes are not
+                covered.
         """
         super().__init__()
         self.client = AsyncGraphDatabase.driver(
@@ -114,6 +221,24 @@ class ArcadeDBDriver(GraphDriver):
         self._user = user or ''
         self._password = password or ''
         self._http_uri = http_uri or self._default_http_uri(uri)
+        self.embedding_dim = embedding_dim
+        if vector_quantization not in ('none', 'scalar', 'binary'):
+            raise ValueError(
+                f"vector_quantization must be 'none', 'scalar' or 'binary', not "
+                f'{vector_quantization!r}'
+            )
+        self.vector_quantization: ArcadeDBVectorQuantization = vector_quantization
+        self.use_vector_index = use_vector_index
+        self._buckets = buckets
+        # Clones (one per group_id database) provision themselves on first use; the
+        # set and lock are shared by every clone of this driver.
+        self._auto_provision = False
+        self._default_database = database
+        self._provisioned: set[str] = {database}
+        self._existing: set[str] = set()
+        self._provision_lock = asyncio.Lock()
+        self._write_concurrency = write_concurrency
+        self._write_gates: dict[str, asyncio.Semaphore] = {}
 
         # Instantiate ArcadeDB operations
         self._entity_node_ops = ArcadeDBEntityNodeOperations()
@@ -179,7 +304,11 @@ class ArcadeDBDriver(GraphDriver):
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[Transaction]:
         """ArcadeDB transaction with real commit/rollback semantics via Bolt."""
-        async with self.client.session(database=self._database) as session:
+        await self._ensure_database()
+        async with (
+            self._write_gate(self._database),
+            self.client.session(database=self._database) as session,
+        ):
             tx = await session.begin_transaction()
             try:
                 yield _ArcadeDBTransaction(tx)
@@ -188,16 +317,56 @@ class ArcadeDBDriver(GraphDriver):
                 await tx.rollback()
                 raise
 
+    @asynccontextmanager
+    async def _write_gate(self, database: str) -> AsyncIterator[None]:
+        """Admit at most ``write_concurrency`` writers per database from this process.
+
+        A write that already holds the gate (a ``driver.execute_query`` inside
+        ``driver.transaction()``) passes straight through instead of waiting for itself.
+        """
+        if self._write_concurrency is None:
+            yield
+            return
+        gate = self._write_gates.get(database)
+        if gate is None:
+            gate = self._write_gates[database] = asyncio.Semaphore(self._write_concurrency)
+        held = _held_write_gates.get()
+        if id(gate) in held:
+            yield
+            return
+        async with gate:
+            token = _held_write_gates.set(held | {id(gate)})
+            try:
+                yield
+            finally:
+                _held_write_gates.reset(token)
+
     async def execute_query(self, cypher_query_: LiteralString, **kwargs: Any) -> EagerResult:
         params = kwargs.pop('params', None)
         if params is None:
             params = {}
         kwargs.setdefault('database_', self._database)
+        if kwargs.get('routing_') == 'r':
+            if not await self._readable(kwargs['database_']):
+                return EagerResult(records=[], summary=None, keys=[])  # type: ignore[arg-type]
+        else:
+            await self._ensure_database(kwargs['database_'])
 
+        gate = (
+            nullcontext()
+            if kwargs.get('routing_') == 'r'
+            else self._write_gate(kwargs['database_'])
+        )
         try:
-            result = await self.client.execute_query(cypher_query_, parameters_=params, **kwargs)
+            async with gate:
+                result = await self.client.execute_query(
+                    cypher_query_, parameters_=_compact_vectors(params), **kwargs
+                )
         except Exception as e:
-            logger.error(f'Error executing ArcadeDB query: {e}\n{cypher_query_}\n{params}')
+            # Parameter values can carry episode content, so only their names are logged.
+            logger.error(
+                f'Error executing ArcadeDB query: {e}\n{cypher_query_}\nparams: {sorted(params)}'
+            )
             raise
 
         return result
@@ -215,15 +384,98 @@ class ArcadeDBDriver(GraphDriver):
         The Bolt client is shared: it is not bound to a database (session() and
         execute_query() take database_ per call), so closing one clone closes
         them all, as it does for the other drivers.
+
+        Graphiti's default group_id (``''``) names no database; it means the database
+        this driver was constructed with, as for FalkorDB's default graph.
         """
-        cloned = object.__new__(ArcadeDBDriver)
-        cloned.__dict__.update(self.__dict__)
+        if database == self.default_group_id:
+            database = self._default_database
+        cloned = copy.copy(self)
         cloned._database = database
+        # Graphiti derives these databases from group_id, so nothing else would ever
+        # create them: the clone provisions its database (and indexes) on first use.
+        cloned._auto_provision = True
         return cloned
+
+    async def _ensure_database(self, database: str | None = None) -> None:
+        """Create ``database`` and its indexes the first time this process uses it.
+
+        Only clones do this (``_auto_provision``); the database a driver was constructed
+        with is the caller's to manage. Existence is probed over Bolt, so an existing
+        database needs no HTTP access; creating one needs the HTTP API (``http_uri``).
+        Indexes are built every time a database is first seen, not only when it was
+        created, because they are idempotent and a database made by an earlier run may
+        have been abandoned half way.
+        """
+        database = database or self._database
+        if not self._auto_provision or database in self._provisioned:
+            return
+
+        async with self._provision_lock:
+            if database in self._provisioned:
+                return
+            if not _DATABASE_NAME.fullmatch(database):
+                raise ValueError(f'Invalid ArcadeDB database name: {database!r}')
+
+            if not await self._database_exists(database):
+                await self._create_database(database)
+
+            scoped = copy.copy(self)
+            scoped._database = database
+            scoped._auto_provision = False
+            await scoped.build_indices_and_constraints()
+            self._provisioned.add(database)
+
+    async def _readable(self, database: str) -> bool:
+        """Whether a read may go to ``database``; a missing one is an empty tenant, not an error.
+
+        A search with a mistyped ``group_id`` used to create (and index) a database just to
+        find nothing in it. Reads of a missing database now come back empty and leave
+        creation to the first write. Existence is cached once seen, so only the first read
+        of a tenant pays the probe.
+        """
+        if not self._auto_provision or database in self._provisioned or database in self._existing:
+            return True
+        if not _DATABASE_NAME.fullmatch(database):
+            raise ValueError(f'Invalid ArcadeDB database name: {database!r}')
+        if await self._database_exists(database):
+            self._existing.add(database)
+            return True
+        return False
+
+    async def _database_exists(self, database: str) -> bool:
+        try:
+            async with self.client.session(database=database) as session:
+                result = await session.run('RETURN 1')
+                await result.consume()
+            return True
+        except ClientError as e:
+            if e.code == 'Neo.ClientError.Database.DatabaseNotFound':
+                return False
+            raise
+
+    async def _create_database(self, database: str) -> None:
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f'{self._http_uri}/api/v1/server',
+                    json={'command': f'create database {database}'},
+                    auth=(self._user, self._password),
+                    timeout=30.0,
+                )
+            # Another process may have created it between the probe and here.
+            if response.status_code >= 400 and 'already exists' not in response.text:
+                response.raise_for_status()
+        except httpx.HTTPError as e:
+            raise RuntimeError(
+                f'ArcadeDB database {database!r} does not exist and could not be created via '
+                f'the HTTP API at {self._http_uri} ({e}). Graphiti uses one database per '
+                f'group_id; pass http_uri= or create the database yourself.'
+            ) from e
 
     def session(self, database: str | None = None) -> GraphDriverSession:
         _database = database or self._database
-        return self.client.session(database=_database)  # type: ignore
+        return _ArcadeDBSession(self, self.client.session(database=_database), _database)
 
     async def close(self) -> None:
         return await self.client.close()
@@ -249,39 +501,67 @@ class ArcadeDBDriver(GraphDriver):
         )
         return f'{scheme}://{host}:{cls.DEFAULT_HTTP_PORT}'
 
-    async def _execute_sql(self, client: httpx.AsyncClient, statement: str) -> None:
-        """Run a single ArcadeDB SQL statement over the HTTP API.
+    async def _warn_if_server_predates_fixes(self) -> None:
+        """Warn when the server is older than the first release with ArcadeData/arcadedb#11486.
 
-        Full-text DDL has no Cypher equivalent, so it cannot go over Bolt.
+        Older servers return correct rows but scan on every uuid edge lookup and edge save, and
+        a concurrent ``MERGE`` of one relationship (several processes, or ``write_concurrency``
+        None) can store it more than once. The version comes from the HTTP API; a snapshot reports
+        its upcoming version, so this only catches releases, and it never raises.
         """
-        response = await client.post(
-            f'{self._http_uri}/api/v1/command/{self._database}',
-            json={'language': 'sql', 'command': statement},
-            auth=(self._user, self._password),
-            timeout=30.0,
-        )
-        response.raise_for_status()
-
-    async def _create_fulltext_indices(self) -> None:
-        """Create the BM25 full-text indexes over HTTP/SQL.
-
-        Best-effort: if the HTTP API is unreachable the rest of the driver still works,
-        but full-text search will return nothing, so failure is logged at warning level.
-        """
-        statements = get_fulltext_indices(self.provider)
-        if not statements:
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f'{self._http_uri}/api/v1/server',
+                    auth=(self._user, self._password),
+                    timeout=10.0,
+                )
+                response.raise_for_status()
+                version = str(response.json().get('version', ''))
+        except (httpx.HTTPError, ValueError):
             return
+        match = re.match(r'(\d+)\.(\d+)\.(\d+)', version)
+        if match and tuple(int(x) for x in match.groups()) < ARCADEDB_MIN_FIXED_VERSION:
+            logger.warning(
+                f'ArcadeDB {version} predates ArcadeData/arcadedb#11486: edge lookups by uuid and '
+                f'edge saves scan instead of using the index, and concurrent saves of one edge '
+                f'from several processes can store it twice. Use 26.12.1-SNAPSHOT build 601600ee '
+                f'or newer.'
+            )
+
+    async def _create_types(self) -> None:
+        """Pre-create the vertex/edge types with a fixed bucket count over HTTP/SQL.
+
+        ArcadeDB creates types implicitly with a default bucket count; more buckets let
+        concurrent writers land on different buckets. ``BUCKETS`` can only be set at
+        creation (ALTER TYPE rejects it) and has no Cypher form, so this needs the HTTP
+        API. Best-effort: if it is unreachable the types are created implicitly later with
+        the default bucket count, which only costs write concurrency.
+        """
+        statements = [
+            f'CREATE VERTEX TYPE {name} IF NOT EXISTS BUCKETS {self._buckets}'
+            for name in ARCADEDB_VERTEX_TYPES
+        ] + [
+            f'CREATE EDGE TYPE {name} IF NOT EXISTS BUCKETS {self._buckets}'
+            for name in ARCADEDB_EDGE_TYPES
+        ]
 
         async with httpx.AsyncClient() as client:
             for statement in statements:
                 try:
-                    await self._execute_sql(client, statement)
+                    response = await client.post(
+                        f'{self._http_uri}/api/v1/command/{self._database}',
+                        json={'language': 'sql', 'command': statement},
+                        auth=(self._user, self._password),
+                        timeout=30.0,
+                    )
+                    response.raise_for_status()
                 except httpx.HTTPError as e:
                     logger.warning(
-                        f'Could not create ArcadeDB full-text index via the HTTP API at '
-                        f'{self._http_uri} ({e}). Full-text search will return no results. '
-                        f'Pass http_uri= if the HTTP API is not on port '
-                        f'{self.DEFAULT_HTTP_PORT}. Failed statement: {statement}'
+                        f'Could not pre-create ArcadeDB types with BUCKETS {self._buckets} via '
+                        f'the HTTP API at {self._http_uri} ({e}); types will be created '
+                        f'implicitly with the default bucket count. Pass http_uri= if the HTTP '
+                        f'API is not on port {self.DEFAULT_HTTP_PORT}.'
                     )
                     return
 
@@ -289,16 +569,29 @@ class ArcadeDBDriver(GraphDriver):
         if delete_existing:
             await self.delete_all_indexes()
 
-        range_indices: list[LiteralString] = get_range_indices(self.provider)
+        await self._create_types()
+        await self._warn_if_server_predates_fixes()
 
-        for query in range_indices:
+        queries: list[LiteralString] = get_range_indices(self.provider) + get_fulltext_indices(
+            self.provider
+        )
+        if self.use_vector_index:
+            queries += get_vector_indices(
+                self.provider, self.embedding_dim, self.vector_quantization
+            )
+
+        for query in queries:
             try:
                 await self.execute_query(query)
             except Exception as e:
-                # Index may already exist
-                logger.debug(f'Index creation skipped (may already exist): {e}')
-
-        await self._create_fulltext_indices()
+                if _OLD_SERVER_INDEX_DDL_ERROR in str(e):
+                    raise RuntimeError(
+                        'ArcadeDB 26.11.1 or newer is required: this server rejects the Cypher '
+                        'CREATE FULLTEXT INDEX / CREATE VECTOR INDEX statements Graphiti uses '
+                        f'to build its search indexes ({e}).'
+                    ) from e
+                # Every statement is IF NOT EXISTS, so a failure here is real.
+                logger.warning(f'ArcadeDB index creation failed: {e}\n{query}')
 
     async def health_check(self) -> None:
         """Check ArcadeDB connectivity via the Bolt driver."""
@@ -310,6 +603,21 @@ class ArcadeDBDriver(GraphDriver):
             raise
 
 
+class _CompactingTransaction:
+    """The Bolt transaction handed to ``execute_write``/``execute_read`` callbacks, with the
+    float vectors in the parameters of ``run`` made cheap to ``repr`` (see ``_FloatVector``);
+    everything else is the wrapped transaction's."""
+
+    def __init__(self, tx: Any):
+        self._tx = tx
+
+    async def run(self, query: str, parameters: Any = None, **kwargs: Any) -> Any:
+        return await self._tx.run(query, _compact_vectors(parameters), **_compact_vectors(kwargs))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._tx, name)
+
+
 class _ArcadeDBTransaction(Transaction):
     """Wraps a Neo4j AsyncTransaction for ArcadeDB Bolt protocol."""
 
@@ -317,4 +625,54 @@ class _ArcadeDBTransaction(Transaction):
         self._tx = tx
 
     async def run(self, query: str, **kwargs: Any) -> Any:
-        return await self._tx.run(query, **kwargs)
+        return await self._tx.run(query, **_compact_vectors(kwargs))
+
+
+class _ArcadeDBSession(GraphDriverSession):
+    """Session that admits writes through the driver's write gate and, on an
+    auto-provisioning clone, makes sure its database exists first.
+
+    ``ArcadeDBDriver.session()`` is synchronous and callers use the session without
+    entering it (``session.execute_write(...)``), so both have to hang off the
+    operations themselves. ``run`` and ``begin_transaction`` hand the work back to the
+    caller, so they are not gated.
+    """
+
+    provider = GraphProvider.ARCADEDB
+
+    def __init__(self, driver: 'ArcadeDBDriver', session: Any, database: str):
+        self._driver = driver
+        self._session = session
+        self._database = database
+
+    async def __aenter__(self):
+        await self._driver._ensure_database(self._database)
+        await self._session.__aenter__()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return await self._session.__aexit__(exc_type, exc, tb)
+
+    async def run(self, query: str, **kwargs: Any) -> Any:
+        await self._driver._ensure_database(self._database)
+        return await self._session.run(query, **_compact_vectors(kwargs))
+
+    async def close(self):
+        return await self._session.close()
+
+    async def execute_write(self, func, *args, **kwargs):
+        await self._driver._ensure_database(self._database)
+        async with self._driver._write_gate(self._database):
+            return await self._session.execute_write(
+                lambda tx, *a, **kw: func(_CompactingTransaction(tx), *a, **kw), *args, **kwargs
+            )
+
+    async def execute_read(self, func, *args, **kwargs):
+        await self._driver._ensure_database(self._database)
+        return await self._session.execute_read(
+            lambda tx, *a, **kw: func(_CompactingTransaction(tx), *a, **kw), *args, **kwargs
+        )
+
+    async def begin_transaction(self, *args, **kwargs):
+        await self._driver._ensure_database(self._database)
+        return await self._session.begin_transaction(*args, **kwargs)

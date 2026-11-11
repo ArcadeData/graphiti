@@ -23,6 +23,7 @@ import numpy as np
 from numpy._typing import NDArray
 from typing_extensions import LiteralString
 
+from graphiti_core.driver.arcadedb.search_queries import ann_search
 from graphiti_core.driver.driver import (
     GraphDriver,
     GraphProvider,
@@ -82,6 +83,35 @@ def calculate_cosine_similarity(vector1: list[float], vector2: list[float]) -> f
     return dot_product / (norm_vector1 * norm_vector2)
 
 
+def build_lucene_query(
+    query: str,
+    group_ids: list[str] | None,
+    fulltext_syntax: str = '',
+    max_query_length: int = MAX_QUERY_LENGTH,
+) -> str:
+    """Lucene query string scoped to ``group_ids``: ``(group_id:"a" OR group_id:"b") AND (q)``.
+
+    The disjunction is parenthesised: Lucene's classic parser has no AND-over-OR precedence,
+    so ``a OR b AND (q)`` makes ``a`` optional and silently drops that tenant's hits.
+
+    Returns '' when the query is too long to run.
+    """
+    validate_group_ids(group_ids)
+    group_ids_filter_list = (
+        [fulltext_syntax + f'group_id:"{g}"' for g in group_ids] if group_ids is not None else []
+    )
+    group_ids_filter = ' OR '.join(group_ids_filter_list)
+    if group_ids_filter:
+        group_ids_filter = f'({group_ids_filter}) AND '
+
+    lucene_query = lucene_sanitize(query)
+    # If the lucene query is too long return no query
+    if len(lucene_query.split(' ')) + len(group_ids or '') >= max_query_length:
+        return ''
+
+    return group_ids_filter + '(' + lucene_query + ')'
+
+
 def fulltext_query(query: str, group_ids: list[str] | None, driver: GraphDriver):
     validate_group_ids(group_ids)
 
@@ -92,25 +122,7 @@ def fulltext_query(query: str, group_ids: list[str] | None, driver: GraphDriver)
         return query
     elif driver.provider == GraphProvider.FALKORDB:
         return driver.build_fulltext_query(query, group_ids, MAX_QUERY_LENGTH)
-    group_ids_filter_list = (
-        [driver.fulltext_syntax + f'group_id:"{g}"' for g in group_ids]
-        if group_ids is not None
-        else []
-    )
-    group_ids_filter = ''
-    for f in group_ids_filter_list:
-        group_ids_filter += f if not group_ids_filter else f' OR {f}'
-
-    group_ids_filter += ' AND ' if group_ids_filter else ''
-
-    lucene_query = lucene_sanitize(query)
-    # If the lucene query is too long return no query
-    if len(lucene_query.split(' ')) + len(group_ids or '') >= MAX_QUERY_LENGTH:
-        return ''
-
-    full_query = group_ids_filter + '(' + lucene_query + ')'
-
-    return full_query
+    return build_lucene_query(query, group_ids, driver.fulltext_syntax)
 
 
 async def get_episodes_by_mentions(
@@ -204,9 +216,11 @@ async def edge_fulltext_search(
     YIELD relationship AS rel, score
     MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)
     """
-    if driver.provider == GraphProvider.FALKORDB:
-        # FalkorDB plans the MATCH above as a full :Entity label scan for EVERY row the
-        # fulltext index yields, so the cost is O(hits x entities). The relationship the
+    if driver.provider in (GraphProvider.FALKORDB, GraphProvider.ARCADEDB):
+        # The MATCH above costs O(hits x data) for EVERY row the fulltext index yields:
+        # FalkorDB plans it as a full :Entity label scan, and ArcadeDB resolves
+        # `{uuid: rel.uuid}` by scanning the RELATES_TO edges (its relationship property
+        # index is not used there; ~100 ms per hit at 20k edges). The relationship the
         # index already returned knows its own endpoints, so read them directly. The label
         # predicate keeps the result set identical to the pattern's.
         match_query = """
@@ -219,14 +233,6 @@ async def edge_fulltext_search(
         match_query = """
         YIELD node, score
         MATCH (n:Entity)-[:RELATES_TO]->(e:RelatesToNode_ {uuid: node.uuid})-[:RELATES_TO]->(m:Entity)
-        """
-    elif driver.provider == GraphProvider.ARCADEDB:
-        # ArcadeDB needs an explicit WITH between CALL ... YIELD and MATCH; without
-        # that barrier the MATCH silently returns no rows.
-        match_query = """
-        YIELD relationship AS rel, score
-        WITH rel, score
-        MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)
         """
 
     filter_queries, filter_params = edge_search_filter_query_constructor(
@@ -689,6 +695,22 @@ async def node_similarity_search(
         search_filter, driver.provider
     )
 
+    if driver.provider == GraphProvider.ARCADEDB and getattr(driver, 'use_vector_index', False):
+        ann_records = await ann_search(
+            driver,
+            label='Entity',
+            alias='n',
+            return_query=get_entity_node_return_query(driver.provider),
+            search_vector=search_vector,
+            filter_queries=filter_queries,
+            filter_params=filter_params,
+            group_ids=group_ids,
+            limit=limit,
+            min_score=min_score,
+        )
+        if ann_records is not None:
+            return [get_entity_node_from_record(record, driver.provider) for record in ann_records]
+
     if group_ids is not None:
         filter_queries.append('n.group_id IN $group_ids')
         filter_params['group_ids'] = group_ids
@@ -1075,6 +1097,22 @@ async def community_similarity_search(
             )
         except NotImplementedError:
             pass
+
+    if driver.provider == GraphProvider.ARCADEDB and getattr(driver, 'use_vector_index', False):
+        ann_records = await ann_search(
+            driver,
+            label='Community',
+            alias='c',
+            return_query=COMMUNITY_NODE_RETURN,
+            search_vector=search_vector,
+            filter_queries=[],
+            filter_params={},
+            group_ids=group_ids,
+            limit=limit,
+            min_score=min_score,
+        )
+        if ann_records is not None:
+            return [get_community_node_from_record(record) for record in ann_records]
 
     # vector similarity search over entity names
     query_params: dict[str, Any] = {}

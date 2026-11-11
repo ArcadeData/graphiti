@@ -95,8 +95,9 @@ ARCADEDB_URI = os.getenv('ARCADEDB_URI', 'bolt://localhost:7687')
 ARCADEDB_USER = os.getenv('ARCADEDB_USER', 'root')
 ARCADEDB_PASSWORD = os.getenv('ARCADEDB_PASSWORD', 'playwithdata')
 ARCADEDB_DATABASE = os.getenv('ARCADEDB_DATABASE', 'graphiti')
-# Only used to create full-text indexes, which ArcadeDB's Cypher channel cannot express.
-ARCADEDB_HTTP_URI = os.getenv('ARCADEDB_HTTP_URI') or None
+# HTTP API of the test server (docker-compose.arcadedb.yml maps it to 2481). Never leave
+# this unset: the driver would then fall back to port 2480 of the Bolt host.
+ARCADEDB_HTTP_URI = os.getenv('ARCADEDB_HTTP_URI', 'http://localhost:2481')
 
 group_id = 'graphiti_test_group'
 group_id_2 = 'graphiti_test_group_2'
@@ -128,12 +129,17 @@ def get_driver(provider: GraphProvider) -> GraphDriver:
             aoss_host=AOSS_HOST,
         )
     elif provider == GraphProvider.ARCADEDB:
+        # The shared suites write both 384-dim helper embeddings and the 1024-dim
+        # Graphiti default into one database, which a vector index (fixed dimension)
+        # cannot hold. They run the exact similarity path; the ANN path is covered by
+        # tests/driver/test_arcadedb_driver_int.py.
         return ArcadeDBDriver(
             uri=ARCADEDB_URI,
             user=ARCADEDB_USER,
             password=ARCADEDB_PASSWORD,
             database=ARCADEDB_DATABASE,
             http_uri=ARCADEDB_HTTP_URI,
+            use_vector_index=False,
         )
     else:
         raise ValueError(f'Driver {provider} not available')

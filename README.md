@@ -156,7 +156,7 @@ particularly suitable for applications requiring real-time interaction and preci
 Requirements:
 
 - Python 3.10 or higher
-- Neo4j 5.26 / FalkorDB 1.1.2 / Kuzu 0.11.2 / ArcadeDB 26.9.1 / Amazon Neptune Database Cluster or Neptune Analytics Graph + Amazon
+- Neo4j 5.26 / FalkorDB 1.1.2 / Kuzu 0.11.2 / ArcadeDB 26.12.1 (build 601600ee or newer) / Amazon Neptune Database Cluster or Neptune Analytics Graph + Amazon
   OpenSearch Serverless collection (serves as the full text search backend)
 - OpenAI API key (Graphiti defaults to OpenAI for LLM inference and embedding)
 
@@ -439,26 +439,34 @@ graphiti = Graphiti(graph_driver=driver)
 
 #### ArcadeDB
 
+A build containing [ArcadeData/arcadedb#11486](https://github.com/ArcadeData/arcadedb/pull/11486) is
+required (26.12.1-SNAPSHOT, build `601600ee` or newer; no release has it yet). It makes the edge lookups by `uuid`
+that Graphiti sends use the relationship index (`MATCH EDGE BY INDEX`) and stores a concurrently saved edge once. The
+Cypher `CREATE FULLTEXT INDEX` / `CREATE VECTOR INDEX` DDL and the 3-argument `db.index.fulltext.query*` procedures
+need 26.11.1 (26.10.x rejects them), and a 26.11.1 server still works but scans on every uuid lookup and edge save, and a
+concurrent save of one edge from several processes can store it twice
+(about 44 ms instead of 7 ms per `get_by_uuid` at 20k edges, 100-650 ms instead of 2-4 ms per edge save at 50k nodes).
+
 ```python
 from graphiti_core import Graphiti
 from graphiti_core.driver.arcadedb_driver import ArcadeDBDriver
 
 # Create an ArcadeDB driver
-# ArcadeDB 26.9.1 is the tested version. The Bolt protocol ships as a server plugin
-# that must be enlisted at startup and listens on port 7687 by default:
-#   -Darcadedb.server.plugins=Bolt:com.arcadedb.bolt.BoltProtocolPlugin
 driver = ArcadeDBDriver(
     uri="bolt://localhost:7687",
     user="root",
     password="playwithdata",
     database="graphiti",  # Optional, defaults to 'graphiti'
-    # Optional. Only used to create the BM25 full-text indexes, which ArcadeDB's
-    # Cypher channel cannot express. Defaults to the Bolt host on port 2480.
+    # Optional. HTTP API of the same server, used to create types with a bucket count and,
+    # for a group_id that has no database yet, that database. Defaults to the Bolt host on
+    # port 2480.
     http_uri="http://localhost:2480",
+    embedding_dim=1024,  # Optional. Omit to let the vector index size itself from the first embedding.
 )
 
-# Pass the driver to Graphiti
+# Pass the driver to Graphiti, and create the indexes (ArcadeDB does not do so on connect)
 graphiti = Graphiti(graph_driver=driver)
+await graphiti.build_indices_and_constraints()
 ```
 
 Starting the server with Bolt enabled:
@@ -466,15 +474,36 @@ Starting the server with Bolt enabled:
 ```bash
 docker run -d -p 2480:2480 -p 7687:7687 \
   -e JAVA_OPTS="-Darcadedb.server.rootPassword=playwithdata \
-    -Darcadedb.server.plugins=Bolt:com.arcadedb.bolt.BoltProtocolPlugin" \
-  arcadedata/arcadedb:26.9.1
+    -Darcadedb.server.plugins=Bolt:com.arcadedb.bolt.BoltProtocolPlugin \
+    -Darcadedb.server.defaultDatabases=graphiti[root]" \
+  arcadedata/arcadedb:latest
 ```
 
-Full-text (BM25) search uses ArcadeDB's Neo4j-compatible `db.index.fulltext.*` procedures,
-available since 26.9.1. Creating those indexes requires ArcadeDB SQL, which the Bolt/Cypher
-channel rejects, so `build_indices_and_constraints()` creates them over the HTTP API. If the
-HTTP API is unreachable, index creation is skipped with a warning and full-text search
-returns no results; everything else keeps working.
+Notes:
+
+- Full-text (BM25) search uses the `db.index.fulltext.*` procedures and node/community similarity search uses an
+  HNSW vector index (`db.index.vector.queryNodes`) with the `group_id` filter applied inside the index search.
+  Relationships have no ANN procedure, so fact similarity is scored exactly in the query. Both index kinds are
+  created by `build_indices_and_constraints()`; `use_vector_index=False` skips the vector index and scores exactly.
+- A vector index has a fixed dimension, so one database holds embeddings of one dimension only.
+- Like FalkorDB, each `group_id` is its own database: passing a `group_id` to `add_episode`/`search` creates that
+  database and its indexes on first use (this needs `http_uri`).
+- Concurrent writers are admitted one at a time per database (`write_concurrency=1`; `None` lifts the limit).
+  ArcadeDB aborts one of two concurrent transactions that touch the same vertices and the Bolt driver then waits
+  before retrying, so concurrent batch writes such as `add_episode` finish sooner this way (8 writers, 25-edge batches:
+  2.5-2.9k vs 0.2-0.5k edges/s on the build above). The cost is that many concurrent small independent saves
+  (`EntityNode.save`, `EntityEdge.save`) are serialised too: 8 callers measured 0.8-1.0k saves/s against 2.0-2.6k
+  ungated, so pass `write_concurrency=None` if that pattern dominates. The limit is per process. (Concurrent saves of the
+  same edge no longer need it: the build above stores such an edge once.)
+- Bulk loads are limited by the Bolt client, not by the server. For a batch of 500 edges with 1024-dimension embeddings,
+  the Neo4j Python driver spends about 200 ms encoding the 4 MB of floats in pure Python and another 120 ms building a
+  debug log line for them (as an argument evaluated even with logging off), while ArcadeDB waits on the socket. The ArcadeDB
+  driver removes the second cost for the embeddings it sends. The first goes away with the driver's Rust codec:
+  `pip install neo4j-rust-ext==<your neo4j version>.0` (the extension pins the exact `neo4j` release, so it changes the
+  driver version if the two differ). Single-writer `add_nodes_and_edges_bulk` on drivers 6.1.0 and 6.4.1, each with its
+  matching extension, went from 1,163-1,176 to 3,513-3,615 edges/s and from 1,339-1,423 to 7,785-7,889 nodes/s; the
+  unit tests and live ArcadeDB suites pass on both combinations.
+- `docker-compose.arcadedb.yml` starts a server for development and tests (HTTP on 2481, Bolt on 7687).
 
 ## Graph Driver Architecture
 
@@ -597,6 +626,7 @@ For reference implementations, look at:
 - **Kuzu** — example of an embedded/in-process database with dialect differences
 - **Neptune** — example of a cloud backend with an external search index (OpenSearch)
 - **ArcadeDB** — uses the Neo4j Bolt wire protocol with ArcadeDB-specific query adaptations
+
 Contributing a new graph backend? See [Adding a graph driver](CONTRIBUTING.md#adding-a-graph-driver).
 
 ## Using Graphiti with Azure OpenAI

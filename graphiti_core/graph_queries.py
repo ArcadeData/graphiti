@@ -5,6 +5,8 @@ This module provides database-agnostic query generation for Neo4j and FalkorDB,
 supporting index creation, fulltext search, and bulk operations.
 """
 
+from typing import Literal, cast
+
 from typing_extensions import LiteralString
 
 from graphiti_core.driver.driver import GraphProvider
@@ -24,32 +26,18 @@ INDEX_TO_LABEL_KUZU_MAPPING = {
     'edge_name_and_fact': 'RelatesToNode_',
 }
 
-# ArcadeDB addresses a full-text index by "Type[prop1,prop2]" rather than by a logical
-# name, so the index name is derived from the type and the exact property list it was
-# created on. These MUST stay in step with ARCADEDB_FULLTEXT_DDL below.
-ARCADEDB_FULLTEXT_INDEX_PROPERTIES: dict[str, tuple[str, tuple[str, ...]]] = {
-    'node_name_and_summary': ('Entity', ('name', 'summary', 'group_id')),
-    'community_name': ('Community', ('name', 'group_id')),
-    'episode_content': ('Episodic', ('content', 'source', 'source_description', 'group_id')),
-    'edge_name_and_fact': ('RELATES_TO', ('name', 'fact', 'group_id')),
-}
-
-
-def get_arcadedb_fulltext_index_name(name: str) -> str:
-    """Return the ArcadeDB "Type[prop,...]" identifier for a graphiti index name."""
-    type_name, properties = ARCADEDB_FULLTEXT_INDEX_PROPERTIES[name]
-    return f'{type_name}[{",".join(properties)}]'
+# ArcadeDB's fulltext and vector indexes are created with Cypher DDL (26.11.1+) and
+# addressed by the name given in that DDL, so ArcadeDB reuses the logical fulltext index
+# names the other providers use (node_name_and_summary, ...).
 
 
 def get_range_indices(provider: GraphProvider) -> list[LiteralString]:
     if provider == GraphProvider.ARCADEDB:
-        # These are emitted over the Bolt/Cypher channel, so they must be Cypher --
-        # ArcadeDB's own SQL DDL (CREATE VERTEX TYPE ..., CREATE INDEX ... NOTUNIQUE)
-        # is rejected there with "mismatched input 'TYPE'/'ON'". Vertex and edge types
-        # do not need to be declared up front: ArcadeDB creates them implicitly on the
-        # first MERGE/CREATE. Standard, RANGE and TEXT indexes are all creatable via
-        # Cypher; only FULLTEXT is rejected (see get_fulltext_indices), so these reuse
-        # the same Cypher syntax as the default Neo4j case below.
+        # Emitted over the Bolt/Cypher channel, so these must be Cypher (ArcadeDB's SQL
+        # DDL is rejected there). Vertex and edge types need not be declared up front:
+        # ArcadeDB creates them implicitly on the first MERGE/CREATE or CREATE INDEX.
+        # Standard and RANGE indexes use the same Cypher syntax as the default Neo4j
+        # case below.
         return [
             'CREATE INDEX entity_uuid IF NOT EXISTS FOR (n:Entity) ON (n.uuid)',
             'CREATE INDEX episode_uuid IF NOT EXISTS FOR (n:Episodic) ON (n.uuid)',
@@ -137,42 +125,7 @@ def get_range_indices(provider: GraphProvider) -> list[LiteralString]:
 
 
 def get_fulltext_indices(provider: GraphProvider) -> list[LiteralString]:
-    if provider == GraphProvider.ARCADEDB:
-        # NOTE: unlike every other provider, these are ArcadeDB *SQL* statements, not
-        # Cypher. The Bolt/Cypher channel rejects full-text DDL outright ("Only
-        # standard, RANGE and TEXT index types are supported"), and `CREATE TEXT INDEX`
-        # builds a non-BM25 index that db.index.fulltext.queryNodes() will not accept.
-        # ArcadeDBDriver therefore runs these over the HTTP/SQL endpoint; see
-        # ArcadeDBDriver._create_fulltext_indices().
-        #
-        # Property lists must match ARCADEDB_FULLTEXT_INDEX_PROPERTIES above: ArcadeDB
-        # names the resulting index after the type and properties it covers.
-        return [
-            'CREATE VERTEX TYPE Entity IF NOT EXISTS',
-            'CREATE PROPERTY Entity.name IF NOT EXISTS STRING',
-            'CREATE PROPERTY Entity.summary IF NOT EXISTS STRING',
-            'CREATE PROPERTY Entity.group_id IF NOT EXISTS STRING',
-            'CREATE INDEX IF NOT EXISTS ON Entity (name, summary, group_id) FULL_TEXT ENGINE LUCENE',
-            'CREATE VERTEX TYPE Community IF NOT EXISTS',
-            'CREATE PROPERTY Community.name IF NOT EXISTS STRING',
-            'CREATE PROPERTY Community.group_id IF NOT EXISTS STRING',
-            'CREATE INDEX IF NOT EXISTS ON Community (name, group_id) FULL_TEXT ENGINE LUCENE',
-            'CREATE VERTEX TYPE Episodic IF NOT EXISTS',
-            'CREATE PROPERTY Episodic.content IF NOT EXISTS STRING',
-            'CREATE PROPERTY Episodic.source IF NOT EXISTS STRING',
-            'CREATE PROPERTY Episodic.source_description IF NOT EXISTS STRING',
-            'CREATE PROPERTY Episodic.group_id IF NOT EXISTS STRING',
-            'CREATE INDEX IF NOT EXISTS ON Episodic (content, source, source_description, group_id) FULL_TEXT ENGINE LUCENE',
-            'CREATE EDGE TYPE RELATES_TO IF NOT EXISTS',
-            'CREATE PROPERTY RELATES_TO.name IF NOT EXISTS STRING',
-            'CREATE PROPERTY RELATES_TO.fact IF NOT EXISTS STRING',
-            'CREATE PROPERTY RELATES_TO.group_id IF NOT EXISTS STRING',
-            'CREATE INDEX IF NOT EXISTS ON RELATES_TO (name, fact, group_id) FULL_TEXT ENGINE LUCENE',
-        ]
-
     if provider == GraphProvider.FALKORDB:
-        from typing import cast
-
         from graphiti_core.driver.falkordb import STOPWORDS
 
         # Convert to string representation for embedding in queries
@@ -227,6 +180,48 @@ def get_fulltext_indices(provider: GraphProvider) -> list[LiteralString]:
     ]
 
 
+ArcadeDBVectorQuantization = Literal['none', 'scalar', 'binary']
+
+# (index name, node label) pairs that get an ANN index. Relationships have no ANN
+# procedure in ArcadeDB (db.index.vector only has queryNodes), so fact_embedding is
+# searched exactly and gets no index.
+ARCADEDB_VECTOR_INDEXES: tuple[tuple[str, str], ...] = (
+    ('entity_name_embedding', 'Entity'),
+    ('community_name_embedding', 'Community'),
+)
+
+
+def get_vector_indices(
+    provider: GraphProvider,
+    embedding_dim: int | None = None,
+    quantization: ArcadeDBVectorQuantization = 'none',
+) -> list[LiteralString]:
+    """Cypher DDL for the ANN (HNSW) vector indexes; only ArcadeDB has any.
+
+    ``embedding_dim=None`` omits ``vector.dimensions`` so the index sizes itself from the
+    first vector written (ArcadeDB 26.11.1+).
+    """
+    if provider != GraphProvider.ARCADEDB:
+        return []
+
+    config = [
+        "`vector.similarity_function`: 'cosine'",
+        f"`vector.quantization.type`: '{quantization}'",
+    ]
+    if embedding_dim is not None:
+        config.insert(0, f'`vector.dimensions`: {int(embedding_dim)}')
+    options = ', '.join(config)
+
+    return cast(
+        list[LiteralString],
+        [
+            f'CREATE VECTOR INDEX {index_name} IF NOT EXISTS FOR (n:{label}) '
+            f'ON n.name_embedding OPTIONS {{indexConfig: {{{options}}}}}'
+            for index_name, label in ARCADEDB_VECTOR_INDEXES
+        ],
+    )
+
+
 def get_nodes_query(name: str, query: str, limit: int, provider: GraphProvider) -> str:
     if provider == GraphProvider.FALKORDB:
         label = NEO4J_TO_FALKORDB_MAPPING[name]
@@ -235,13 +230,6 @@ def get_nodes_query(name: str, query: str, limit: int, provider: GraphProvider) 
     if provider == GraphProvider.KUZU:
         label = INDEX_TO_LABEL_KUZU_MAPPING[name]
         return f"CALL QUERY_FTS_INDEX('{label}', '{name}', {query}, TOP := $limit)"
-
-    if provider == GraphProvider.ARCADEDB:
-        # ArcadeDB's procedure takes exactly 2 arguments; Neo4j's {limit: $limit}
-        # config map is a hard error. Callers already append ORDER BY score DESC
-        # LIMIT $limit, so dropping it is safe.
-        index_name = get_arcadedb_fulltext_index_name(name)
-        return f"CALL db.index.fulltext.queryNodes('{index_name}', {query})"
 
     return f'CALL db.index.fulltext.queryNodes("{name}", {query}, {{limit: $limit}})'
 
@@ -254,6 +242,13 @@ def get_vector_cosine_func_query(vec1, vec2, provider: GraphProvider) -> str:
     if provider == GraphProvider.KUZU:
         return f'array_cosine_similarity({vec1}, {vec2})'
 
+    if provider == GraphProvider.ARCADEDB:
+        # ArcadeDB's vector.similarity.cosine returns the raw cosine in [-1, 1], unlike
+        # Neo4j (normalised). Rescale to (1 + cos) / 2 so min_score thresholds mean the
+        # same thing on every backend and match the score db.index.vector.queryNodes
+        # returns.
+        return f'(1 + vector.similarity.cosine({vec1}, {vec2})) / 2'
+
     return f'vector.similarity.cosine({vec1}, {vec2})'
 
 
@@ -265,10 +260,5 @@ def get_relationships_query(name: str, limit: int, provider: GraphProvider) -> s
     if provider == GraphProvider.KUZU:
         label = INDEX_TO_LABEL_KUZU_MAPPING[name]
         return f"CALL QUERY_FTS_INDEX('{label}', '{name}', cast($query AS STRING), TOP := $limit)"
-
-    if provider == GraphProvider.ARCADEDB:
-        # See the note in get_nodes_query: 2 arguments, no config map.
-        index_name = get_arcadedb_fulltext_index_name(name)
-        return f"CALL db.index.fulltext.queryRelationships('{index_name}', $query)"
 
     return f'CALL db.index.fulltext.queryRelationships("{name}", $query, {{limit: $limit}})'
