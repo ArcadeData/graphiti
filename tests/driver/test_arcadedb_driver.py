@@ -640,6 +640,45 @@ class TestArcadeDBDriver:
 
     @pytest.mark.asyncio
     @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
+    async def test_a_server_older_than_the_index_fixes_is_warned_about(self):
+        self.driver._http_uri = 'http://arcade.invalid:2480'
+
+        def served(version):
+            response = MagicMock()
+            response.json.return_value = {'version': version}
+            client = MagicMock()
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            client.get = AsyncMock(return_value=response)
+            return client
+
+        for version, warned in (
+            ('26.11.1 (build a3a5d12)', True),
+            ('26.10.2', True),
+            ('26.12.1-SNAPSHOT (build 601600ee)', False),
+            ('27.1.0', False),
+            ('unparseable', False),
+        ):
+            with (
+                patch(
+                    'graphiti_core.driver.arcadedb_driver.httpx.AsyncClient',
+                    return_value=served(version),
+                ),
+                patch('graphiti_core.driver.arcadedb_driver.logger') as mock_logger,
+            ):
+                await self.driver._warn_if_server_predates_fixes()
+            assert mock_logger.warning.called is warned, version
+
+        # an unreachable HTTP API is not an error: the check is best effort
+        import httpx
+
+        failing = served('x')
+        failing.get = AsyncMock(side_effect=httpx.ConnectError('down'))
+        with patch('graphiti_core.driver.arcadedb_driver.httpx.AsyncClient', return_value=failing):
+            await self.driver._warn_if_server_predates_fixes()
+
+    @pytest.mark.asyncio
+    @unittest.skipIf(not HAS_ARCADEDB, 'ArcadeDB driver dependencies not available')
     async def test_a_server_without_cypher_index_ddl_fails_loudly(self):
         """ArcadeDB 26.10.x rejects CREATE FULLTEXT / VECTOR INDEX. Swallowing that as a
         warning left Graphiti running with no search indexes at all."""

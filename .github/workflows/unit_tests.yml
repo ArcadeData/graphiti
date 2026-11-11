@@ -83,7 +83,8 @@ jobs:
           # host network its default Bolt port 7687 collides with Neo4j's, so it gets
           # 7688; 2480 is the HTTP API (database and type creation). The image is the
           # 26.12.1-SNAPSHOT build 601600ee, pinned by digest because the first build with
-          # ArcadeData/arcadedb#11486 is not in any release yet and the tag moves.
+          # ArcadeData/arcadedb#11486 is not in any release yet and the tag moves. A pruned
+          # snapshot manifest would break this job: move to the first release with d5dfeff8ba.
           docker run -d --name arcadedb --network host \
             -e JAVA_OPTS="-Darcadedb.server.rootPassword=playwithdata \
               -Darcadedb.server.plugins=Bolt:com.arcadedb.bolt.BoltProtocolPlugin \

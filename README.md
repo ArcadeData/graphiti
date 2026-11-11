@@ -443,7 +443,8 @@ A build containing [ArcadeData/arcadedb#11486](https://github.com/ArcadeData/arc
 required (26.12.1-SNAPSHOT, build `601600ee` or newer; no release has it yet). It makes the edge lookups by `uuid`
 that Graphiti sends use the relationship index (`MATCH EDGE BY INDEX`) and stores a concurrently saved edge once. The
 Cypher `CREATE FULLTEXT INDEX` / `CREATE VECTOR INDEX` DDL and the 3-argument `db.index.fulltext.query*` procedures
-need 26.11.1 (26.10.x rejects them), and a 26.11.1 server still works but scans on every uuid lookup and edge save
+need 26.11.1 (26.10.x rejects them), and a 26.11.1 server still works but scans on every uuid lookup and edge save, and a
+concurrent save of one edge from several processes can store it twice
 (about 44 ms instead of 7 ms per `get_by_uuid` at 20k edges, 100-650 ms instead of 2-4 ms per edge save at 50k nodes).
 
 ```python

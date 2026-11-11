@@ -71,6 +71,8 @@ from graphiti_core.graph_queries import (
 )
 
 ARCADEDB_TYPE_BUCKETS = 16
+# First version number that is not a release without ArcadeData/arcadedb#11486 (26.11.1 and older).
+ARCADEDB_MIN_FIXED_VERSION = (26, 12, 1)
 ARCADEDB_VERTEX_TYPES = ('Entity', 'Episodic', 'Community', 'Saga')
 ARCADEDB_EDGE_TYPES = ('RELATES_TO', 'MENTIONS', 'HAS_MEMBER', 'HAS_EPISODE', 'NEXT_EPISODE')
 _DATABASE_NAME = re.compile(r'[A-Za-z0-9_-]+')
@@ -499,6 +501,34 @@ class ArcadeDBDriver(GraphDriver):
         )
         return f'{scheme}://{host}:{cls.DEFAULT_HTTP_PORT}'
 
+    async def _warn_if_server_predates_fixes(self) -> None:
+        """Warn when the server is older than the first release with ArcadeData/arcadedb#11486.
+
+        Older servers return correct rows but scan on every uuid edge lookup and edge save, and
+        a concurrent ``MERGE`` of one relationship (several processes, or ``write_concurrency``
+        None) can store it more than once. The version comes from the HTTP API; a snapshot reports
+        its upcoming version, so this only catches releases, and it never raises.
+        """
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f'{self._http_uri}/api/v1/server',
+                    auth=(self._user, self._password),
+                    timeout=10.0,
+                )
+                response.raise_for_status()
+                version = str(response.json().get('version', ''))
+        except (httpx.HTTPError, ValueError):
+            return
+        match = re.match(r'(\d+)\.(\d+)\.(\d+)', version)
+        if match and tuple(int(x) for x in match.groups()) < ARCADEDB_MIN_FIXED_VERSION:
+            logger.warning(
+                f'ArcadeDB {version} predates ArcadeData/arcadedb#11486: edge lookups by uuid and '
+                f'edge saves scan instead of using the index, and concurrent saves of one edge '
+                f'from several processes can store it twice. Use 26.12.1-SNAPSHOT build 601600ee '
+                f'or newer.'
+            )
+
     async def _create_types(self) -> None:
         """Pre-create the vertex/edge types with a fixed bucket count over HTTP/SQL.
 
@@ -540,6 +570,7 @@ class ArcadeDBDriver(GraphDriver):
             await self.delete_all_indexes()
 
         await self._create_types()
+        await self._warn_if_server_predates_fixes()
 
         queries: list[LiteralString] = get_range_indices(self.provider) + get_fulltext_indices(
             self.provider
